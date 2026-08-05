@@ -151,8 +151,10 @@ export async function runSubprocess(options) {
   let spawnError = null;
   let stdinError = null;
   let settled = false;
-  const inputText = input === null || input === undefined ? '' : String(input);
-  const inputBytes = Buffer.byteLength(inputText);
+  const inputBuffer = Buffer.isBuffer(input)
+    ? input
+    : Buffer.from(input === null || input === undefined ? '' : String(input));
+  const inputBytes = inputBuffer.length;
 
   const startedAt = Date.now();
   const allowedEnv = buildAllowedEnv(env, envAllowlist);
@@ -220,7 +222,7 @@ export async function runSubprocess(options) {
       }
     });
 
-    child.stdin.end(inputText);
+    child.stdin.end(inputBuffer);
   }).finally(() => {
     if (timeoutId) {
       clearTimeout(timeoutId);

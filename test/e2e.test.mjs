@@ -51,9 +51,9 @@ test('full worker path produces a candidate without landing or deleting its work
         adapter: 'codex',
         baseOid,
         channel: 'review',
-        description: 'Create and commit agent-output.txt',
+        description: 'Create agent-output.txt and leave Git metadata to the controller',
         scope: ['agent-output.txt'],
-        title: 'Create a candidate commit',
+        title: 'Create a candidate file',
       },
     }).task;
 
@@ -72,16 +72,24 @@ test('full worker path produces a candidate without landing or deleting its work
     });
 
     assert.equal(result.status, 'completed', JSON.stringify(result, null, 2));
-    assert.equal(result.run.finalMessage, 'fixture committed');
+    assert.equal(result.run.finalMessage, 'fixture edited the allowed file');
     assert.equal(result.claim.taskId, created.taskId);
     assert.equal(result.worktree.baseOid, baseOid);
     assert.notEqual(result.snapshot.candidateOid, baseOid);
+    assert.equal(
+      git(result.worktree.worktreePath, 'rev-list', '--parents', '-n', '1', result.snapshot.candidateOid),
+      `${result.snapshot.candidateOid} ${baseOid}`,
+    );
     assert.equal(git(repo, 'rev-parse', 'main'), baseOid);
+    assert.equal(
+      git(repo, 'branch', '--contains', result.snapshot.candidateOid, '--format=%(refname:short)'),
+      result.worktree.branchName,
+    );
     assert.equal(existsSync(path.join(repo, 'agent-output.txt')), false);
     assert.equal(existsSync(result.worktree.worktreePath), true);
     assert.match(
       readFileSync(path.join(result.worktree.worktreePath, 'agent-output.txt'), 'utf8'),
-      /committed by fake agent/,
+      /edited by fake agent/,
     );
     assert.equal(git(result.worktree.worktreePath, 'status', '--porcelain'), '');
 
@@ -95,6 +103,61 @@ test('full worker path produces a candidate without landing or deleting its work
   }
 });
 
+test('controller refuses a mutable run that writes outside its allowed scope', async () => {
+  const { repo, root, stateRoot } = createRepository();
+  const baseOid = git(repo, 'rev-parse', 'HEAD');
+  const context = projectContext(repo, { stateRoot });
+  const store = openProjectStore({ dbPath: context.dbPath, secretKeyPath: context.keyPath });
+
+  try {
+    store.configureChannel({ channel: 'review', capacity: 4 });
+    const created = store.createTask({
+      key: 'e2e-scope-rejection',
+      payload: {
+        adapter: 'codex',
+        baseOid,
+        channel: 'review',
+        scope: ['allowed.txt'],
+        title: 'Exercise controller scope rejection',
+      },
+    }).task;
+
+    const result = await runWorkerOnce({
+      adapters: {
+        codex: async ({ cwd }) => {
+          writeFileSync(path.join(cwd, 'allowed.txt'), 'allowed\n', 'utf8');
+          writeFileSync(path.join(cwd, 'escaped.txt'), 'must be rejected\n', 'utf8');
+          return {
+            finalMessage: 'Created two files.',
+            ok: true,
+            terminal: { status: 'success' },
+          };
+        },
+      },
+      context,
+      leaseMs: 2_000,
+      store,
+      worker: 'scope-e2e',
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.match(result.error.message, /escapes allowed scope/i);
+    assert.equal(git(result.worktree.worktreePath, 'rev-parse', 'HEAD'), baseOid);
+    assert.match(git(result.worktree.worktreePath, 'status', '--porcelain'), /allowed\.txt/u);
+    assert.match(git(result.worktree.worktreePath, 'status', '--porcelain'), /escaped\.txt/u);
+    assert.equal(store.getTask(created.taskId).result, null);
+    assert.equal(store.getOutboxMessage(`candidate:${created.taskId}:g1`), null);
+    assert.equal(
+      store.listEventLog().some((entry) => entry.kind === 'task.event.candidate-finalized'),
+      false,
+    );
+    assert.equal(git(repo, 'rev-parse', 'main'), baseOid);
+  } finally {
+    store.close();
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test('full team path fans out real worktrees and aggregates one exact candidate', async () => {
   const { repo, root, stateRoot } = createRepository();
   const baseOid = git(repo, 'rev-parse', 'HEAD');
@@ -104,7 +167,7 @@ test('full team path fans out real worktrees and aggregates one exact candidate'
 
   const plan = {
     schema: 'team.plan.v1',
-    summary: 'Create one committed file and verify the exact candidate through the fixed team DAG.',
+    summary: 'Create one candidate file and verify the exact controller commit through the fixed team DAG.',
     assumptions: ['The fixture repository uses Git and has one initial commit.'],
     acceptanceCriteria: [
       { id: 'ac-file', text: 'team-output.txt exists in the candidate commit.' },
@@ -112,7 +175,7 @@ test('full team path fans out real worktrees and aggregates one exact candidate'
     ],
     lanes: {
       builder: {
-        objective: 'Create team-output.txt, commit it, and leave the worktree clean.',
+        objective: 'Create team-output.txt and leave the working-tree change for the controller.',
         scope: ['team-output.txt'],
       },
       researcher: {
@@ -134,9 +197,7 @@ test('full team path fans out real worktrees and aggregates one exact candidate'
     }
     if (role === 'builder') {
       writeFileSync(path.join(cwd, 'team-output.txt'), 'built by the team e2e fixture\n', 'utf8');
-      git(cwd, 'add', 'team-output.txt');
-      git(cwd, 'commit', '-m', 'Create the team e2e candidate');
-      return { finalMessage: 'Created and committed team-output.txt.', ok: true, terminal: { status: 'success' } };
+      return { finalMessage: 'Created team-output.txt for controller publication.', ok: true, terminal: { status: 'success' } };
     }
     if (role === 'researcher') {
       return { finalMessage: 'The requested output is isolated to team-output.txt.', ok: true, terminal: { status: 'success' } };
@@ -231,6 +292,16 @@ test('full team path fans out real worktrees and aggregates one exact candidate'
     assert.equal(aggregated.status, 'completed', JSON.stringify(aggregated, null, 2));
     assert.equal(aggregated.task.result.verdict, 'READY_FOR_HUMAN');
     assert.notEqual(aggregated.task.result.candidateOid, baseOid);
+    const completedBuilder = store.getTask(childBySlice.builder.taskId);
+    const completedReviewer = store.getTask(childBySlice.reviewer.taskId);
+    const completedVerifier = store.getTask(childBySlice.verifier.taskId);
+    assert.equal(
+      git(repo, 'rev-list', '--parents', '-n', '1', aggregated.task.result.candidateOid),
+      `${aggregated.task.result.candidateOid} ${baseOid}`,
+    );
+    assert.equal(completedBuilder.result.candidateOid, aggregated.task.result.candidateOid);
+    assert.equal(completedReviewer.result.baseOid, aggregated.task.result.candidateOid);
+    assert.equal(completedVerifier.result.baseOid, aggregated.task.result.candidateOid);
     assert.equal(git(repo, 'rev-parse', 'main'), baseOid);
     assert.equal(existsSync(path.join(repo, 'team-output.txt')), false);
     assert.equal(store.listTaskChildren(parent.taskId).every((child) => child.state === 'completed'), true);

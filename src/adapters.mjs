@@ -357,7 +357,21 @@ export async function runCodex(options) {
 }
 
 export async function runClaude(options) {
-  return runAdapter('claude', options, () => ['-p', '--verbose', '--output-format', 'stream-json', '--permission-mode', 'acceptEdits'], CLAUDE_ENV_ALLOWLIST);
+  return runAdapter(
+    'claude',
+    options,
+    () => [
+      '-p',
+      '--safe-mode',
+      '--no-session-persistence',
+      '--verbose',
+      '--output-format',
+      'stream-json',
+      '--permission-mode',
+      'acceptEdits',
+    ],
+    CLAUDE_ENV_ALLOWLIST,
+  );
 }
 
 export const runCodexAdapter = runCodex;

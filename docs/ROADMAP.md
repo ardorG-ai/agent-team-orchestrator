@@ -32,6 +32,7 @@
 - Fenced atomic child fan-out with sibling DAG validation
 - Dependency-failure propagation and durable parent wake-up
 - Generation-fenced team-root retry that reuses the original DAG and completed children
+- Controller-owned, task-scoped candidate commits for mutable CLI runs
 - Exact Builder candidate handoff to independent Reviewer and Verifier
 - Bounded untrusted handoffs and fail-closed structured verdicts
 - Deterministic parent aggregate and one final review delivery

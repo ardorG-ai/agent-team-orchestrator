@@ -22,7 +22,7 @@ function validPlan(overrides = {}) {
     ],
     lanes: {
       builder: {
-        objective: 'Implement the requested behavior and commit the candidate.',
+        objective: 'Implement the requested behavior and leave scoped edits for controller publication.',
         scope: ['src/', 'test/'],
       },
       researcher: {

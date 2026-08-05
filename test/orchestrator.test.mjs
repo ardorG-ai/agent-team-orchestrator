@@ -5,8 +5,23 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { runWorkerOnce } from '../src/orchestrator.mjs';
+import { runWorkerOnce as runWorkerOnceImpl } from '../src/orchestrator.mjs';
 import { OutboxBackpressureError, openProjectStore } from '../src/project-store.mjs';
+
+function runWorkerOnce(options) {
+  return runWorkerOnceImpl({
+    commitWorktreeCandidate: async ({ baseOid, scope, worktreePath }) => ({
+      baseOid,
+      changedPaths: scope.length > 0 ? [...scope] : ['fixture-change'],
+      entryCount: scope.length > 0 ? scope.length : 1,
+      headBefore: baseOid,
+      parentOid: baseOid,
+      scope: [...scope],
+      worktreePath,
+    }),
+    ...options,
+  });
+}
 
 function createStoreHarness(name) {
   const root = mkdtempSync(path.join(os.tmpdir(), `${name}-`));
@@ -42,6 +57,7 @@ test('runWorkerOnce completes a task and publishes a deterministic review candid
   const worktreePath = await makeWorktreeRoot('success');
   const promptCalls = [];
   const adapterCalls = [];
+  const candidateCalls = [];
 
   try {
     store.configureChannel({ channel: 'review', capacity: 3 });
@@ -51,6 +67,7 @@ test('runWorkerOnce completes a task and publishes a deterministic review candid
         adapter: 'codex',
         baseOid: 'base-oid-preferred',
         base: 'feature-base',
+        scope: ['src/'],
         title: 'Ship feature',
       },
     }).task;
@@ -86,6 +103,20 @@ test('runWorkerOnce completes a task and publishes a deterministic review candid
         signal: 'shared signal',
       },
       context: harness.context,
+      commitWorktreeCandidate: async (options) => {
+        candidateCalls.push(options);
+        return {
+          baseOid: options.baseOid,
+          candidateOid: 'b'.repeat(40),
+          changedPaths: ['src/change.mjs'],
+          clean: true,
+          entryCount: 1,
+          headBefore: options.baseOid,
+          parentOid: options.baseOid,
+          scope: ['src'],
+          worktreePath,
+        };
+      },
       createWorktree: async (options) => {
         assert.equal(options.repoPath, harness.context.repoRoot);
         assert.equal(options.ref, 'base-oid-preferred');
@@ -125,6 +156,11 @@ test('runWorkerOnce completes a task and publishes a deterministic review candid
     assert.equal(adapterCalls[0].claude, undefined);
     assert.equal(adapterCalls[0].prompt, `prompt for ${task.taskId} @ ${'a'.repeat(40)}`);
     assert.ok(adapterCalls[0].signal instanceof AbortSignal);
+    assert.equal(candidateCalls.length, 1);
+    assert.equal(candidateCalls[0].baseOid, 'a'.repeat(40));
+    assert.deepEqual(candidateCalls[0].scope, ['src/']);
+    assert.equal(candidateCalls[0].worktreePath, worktreePath);
+    assert.match(candidateCalls[0].commitMessage, /Preserve CLI isolation/);
 
     const completedTask = store.getTask(task.taskId);
     assert.equal(completedTask.state, 'completed');
@@ -159,6 +195,14 @@ test('runWorkerOnce completes a task and publishes a deterministic review candid
     const eventKinds = store.listEventLog().map((entry) => entry.kind);
     assert.ok(eventKinds.includes('task.event.preparation'));
     assert.ok(eventKinds.includes('task.event.runtime'));
+    assert.ok(eventKinds.includes('task.event.candidate-finalized'));
+    const candidateEvent = store.listEventLog()
+      .find((entry) => entry.kind === 'task.event.candidate-finalized');
+    const candidatePayload = JSON.parse(candidateEvent.payload_json).payload;
+    assert.equal(candidatePayload.baseOid, 'a'.repeat(40));
+    assert.equal(candidatePayload.candidateOid, 'b'.repeat(40));
+    assert.equal(candidatePayload.controllerOwned, true);
+    assert.deepEqual(candidatePayload.changedPathsPreview, ['src/change.mjs']);
   } finally {
     store.close();
     harness.cleanup();
@@ -472,6 +516,10 @@ test('runWorkerOnce requeues on review outbox backpressure without marking the t
     assert.equal(queuedTask.error, null);
     assert.equal(queuedTask.result, null);
     assert.equal(store.getOutboxMessage(`candidate:${task.taskId}:g1`), null);
+    assert.equal(
+      store.listEventLog().some((event) => event.kind === 'task.event.candidate-finalized'),
+      false,
+    );
   } finally {
     store.close();
     harness.cleanup();
@@ -482,6 +530,7 @@ test('runWorkerOnce requeues on review outbox backpressure without marking the t
 test('runWorkerOnce aborts the adapter on heartbeat lease loss and does not complete or fail the task', async () => {
   const worktreePath = await makeWorktreeRoot('lost-lease');
   let aborted = false;
+  let candidateCalls = 0;
   let failCalls = 0;
   let completeCalls = 0;
   let heartbeatCalls = 0;
@@ -554,6 +603,10 @@ test('runWorkerOnce aborts the adapter on heartbeat lease loss and does not comp
           }),
       },
       buildPrompt: () => 'prompt',
+      commitWorktreeCandidate: async () => {
+        candidateCalls += 1;
+        throw new Error('lost leases must never publish a candidate');
+      },
       context: {
         repoRoot: worktreePath,
         worktreeRoot: path.dirname(worktreePath),
@@ -576,6 +629,7 @@ test('runWorkerOnce aborts the adapter on heartbeat lease loss and does not comp
     assert.equal(result.status, 'lost-lease');
     assert.equal(aborted, true);
     assert.ok(heartbeatCalls >= 1);
+    assert.equal(candidateCalls, 0);
     assert.equal(failCalls, 0);
     assert.equal(completeCalls, 0);
   } finally {
@@ -691,7 +745,7 @@ function validTeamPlan() {
     assumptions: ['Public APIs remain compatible.'],
     acceptanceCriteria: [{ id: 'ac-1', text: 'The requested behavior works.' }],
     lanes: {
-      builder: { objective: 'Implement and commit the candidate.', scope: ['src/'] },
+      builder: { objective: 'Implement and leave scoped edits for controller publication.', scope: ['src/'] },
       researcher: { objective: 'Report relevant constraints.', scope: [] },
       test: { objective: 'Report required test coverage.', scope: ['test/'] },
     },
@@ -1099,7 +1153,59 @@ test('runWorkerOnce fails closed when a read-only team role changes HEAD', async
   }
 });
 
-test('runWorkerOnce fails closed when a team builder produces no candidate commit', async () => {
+test('runWorkerOnce fails closed when a read-only team role leaves dirty files', async () => {
+  const worktreePath = await makeWorktreeRoot('team-readonly-dirty');
+  const claim = makeTeamClaim({
+    key: 'team/root::researcher-dirty',
+    parentTaskId: 'team-parent',
+    payload: {
+      adapter: 'claude',
+      executionMode: 'report',
+      role: 'researcher',
+      title: 'Research without edits',
+    },
+    sliceKey: 'researcher',
+    taskId: 'team-researcher-dirty',
+  });
+  const store = makeTeamStore({ claim });
+  let candidateCalled = false;
+
+  try {
+    const result = await runWorkerOnce({
+      adapters: {
+        claude: async () => ({
+          finalMessage: 'Research report with an accidental edit.',
+          ok: true,
+          terminal: { status: 'success' },
+        }),
+      },
+      buildPrompt: () => 'prompt',
+      commitWorktreeCandidate: async () => {
+        candidateCalled = true;
+        throw new Error('read-only roles must never reach candidate publication');
+      },
+      context: { repoRoot: worktreePath, worktreeRoot: path.dirname(worktreePath) },
+      createWorktree: async () => ({
+        baseOid: 'a'.repeat(40),
+        branchName: 'team-researcher-dirty-g1',
+        worktreePath,
+      }),
+      snapshotWorktree: async () => {
+        throw new Error('snapshot requires a clean worktree');
+      },
+      store,
+      worker: claim.worker,
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.equal(candidateCalled, false);
+    assert.match(store.calls.failTask[0].error.message, /clean worktree/i);
+  } finally {
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
+test('runWorkerOnce fails closed when a team builder produces no scoped mutation', async () => {
   const worktreePath = await makeWorktreeRoot('team-build-no-commit');
   const claim = makeTeamClaim({
     key: 'team/root::builder',

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { runClaude, runCodex } from './adapters.mjs';
 import { renderRoleLoadout } from './project-assets.mjs';
 import { OutboxBackpressureError } from './project-store.mjs';
@@ -15,6 +17,7 @@ import {
   resolveExecutionMode,
 } from './team-workflow.mjs';
 import {
+  commitWorktreeCandidate as defaultCommitWorktreeCandidate,
   createWorktree as defaultCreateWorktree,
   snapshotWorktree as defaultSnapshotWorktree,
 } from './worktree.mjs';
@@ -157,6 +160,53 @@ function buildPreparationEventPayload(adapterName, requestedRef, worktree) {
     branchName: worktree.branchName,
     requestedRef,
     worktreePath: worktree.worktreePath,
+  };
+}
+
+function isMutableExecution(executionMode) {
+  return executionMode === 'standalone' || executionMode === 'build';
+}
+
+function buildControllerCommitMessage(claim) {
+  return `Preserve CLI isolation while producing a reviewable candidate
+
+The controller captured the task-scoped working-tree changes for task
+${claim.taskId} generation ${claim.generation} after the child CLI reported success.
+
+Constraint: Child CLIs do not write linked-worktree Git metadata
+Confidence: medium
+Scope-risk: moderate
+Reversibility: clean
+Directive: Review and verify this candidate before landing it
+Tested: Controller validated changed paths, exact base parent, and clean snapshot
+Not-tested: Protected-branch integration`;
+}
+
+function buildCandidateFinalizedEventPayload(candidate, snapshot, worktree) {
+  const changedPaths = Array.isArray(candidate?.changedPaths) ? candidate.changedPaths : [];
+  const scope = Array.isArray(candidate?.scope) ? candidate.scope : [];
+  const preview = (values) => values.slice(0, 16).map((value) => (
+    value.length > 256 ? `${value.slice(0, 255)}…` : value
+  ));
+  return {
+    baseOid: worktree.baseOid,
+    candidateOid: snapshot.candidateOid,
+    changedPathCount: changedPaths.length,
+    changedPathsHash: createHash('sha256')
+      .update(JSON.stringify(changedPaths))
+      .digest('hex'),
+    changedPathsPreview: preview(changedPaths),
+    changedPathsTruncated: changedPaths.length > 16,
+    controllerOwned: true,
+    entryCount: Number.isInteger(candidate?.entryCount) ? candidate.entryCount : changedPaths.length,
+    parentCount: Number.isInteger(candidate?.parentCount) ? candidate.parentCount : 1,
+    parentOid: candidate?.parentOid ?? worktree.baseOid,
+    scopeCount: scope.length,
+    scopeHash: createHash('sha256')
+      .update(JSON.stringify(scope))
+      .digest('hex'),
+    scopePreview: preview(scope),
+    scopeTruncated: scope.length > 16,
   };
 }
 
@@ -474,6 +524,7 @@ export async function runWorkerOnce(options = {}) {
 
   const {
     buildPrompt = defaultBuildPrompt,
+    commitWorktreeCandidate = defaultCommitWorktreeCandidate,
     createWorktree = defaultCreateWorktree,
     leaseMs = 30_000,
     snapshotWorktree = defaultSnapshotWorktree,
@@ -661,10 +712,39 @@ export async function runWorkerOnce(options = {}) {
       };
     }
 
+    let candidate = null;
+    if (isMutableExecution(executionMode)) {
+      if (typeof commitWorktreeCandidate !== 'function') {
+        throw new TypeError('options.commitWorktreeCandidate must be a function');
+      }
+      if (heartbeat.lost) {
+        return {
+          claim,
+          run: runResult,
+          status: 'lost-lease',
+          worktree,
+        };
+      }
+
+      candidate = await commitWorktreeCandidate({
+        baseOid: worktree.baseOid,
+        commitMessage: buildControllerCommitMessage(claim),
+        scope: Array.isArray(payload.scope) ? payload.scope : [],
+        worktreePath: worktree.worktreePath,
+      });
+    }
+
     const snapshot = await snapshotWorktree({ worktreePath: worktree.worktreePath });
     assertSnapshot(snapshot);
-    if (executionMode !== 'standalone') {
-      assertExecutionSnapshot(executionMode, snapshot, worktree.baseOid);
+    assertExecutionSnapshot(executionMode, snapshot, worktree.baseOid);
+    if (candidate?.candidateOid !== undefined && candidate.candidateOid !== snapshot.candidateOid) {
+      throw new Error('clean worktree snapshot must resolve to the controller candidate OID');
+    }
+    if (candidate?.parentOid !== undefined && candidate.parentOid !== worktree.baseOid) {
+      throw new Error('controller candidate parent must match the exact worktree base OID');
+    }
+    if (candidate?.parentCount !== undefined && candidate.parentCount !== 1) {
+      throw new Error('controller candidate must have exactly one parent');
     }
 
     if (heartbeat.lost) {
@@ -746,6 +826,12 @@ export async function runWorkerOnce(options = {}) {
         generation: claim.generation,
         ...(completionOutbox ? { outbox: completionOutbox } : {}),
         result: completionResult,
+        ...(candidate ? {
+          taskEvent: {
+            payload: buildCandidateFinalizedEventPayload(candidate, snapshot, worktree),
+            type: 'candidate-finalized',
+          },
+        } : {}),
         taskId: claim.taskId,
         worker: claim.worker,
       });

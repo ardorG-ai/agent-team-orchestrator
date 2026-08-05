@@ -2321,10 +2321,24 @@ export function openProjectStore(options) {
       });
     },
 
-    completeTask({ taskId, worker, generation, claimToken, result = null, outbox = null }) {
+    completeTask({
+      taskId,
+      worker,
+      generation,
+      claimToken,
+      result = null,
+      outbox = null,
+      taskEvent = null,
+    }) {
       requireString('taskId', taskId);
       requireString('worker', worker);
       requireString('claimToken', claimToken);
+      if (taskEvent !== null) {
+        if (!isPlainObject(taskEvent)) {
+          throw new TypeError('taskEvent must be a plain object');
+        }
+        requireString('taskEvent.type', taskEvent.type);
+      }
 
       return withTransaction('IMMEDIATE', () => {
         const completedAt = now();
@@ -2416,6 +2430,16 @@ export function openProjectStore(options) {
 
         if (update.changes !== 1) {
           return null;
+        }
+
+        if (taskEvent) {
+          appendEvent(`task.event.${taskEvent.type}`, 'task', taskId, {
+            taskId,
+            worker,
+            generation,
+            type: taskEvent.type,
+            payload: taskEvent.payload ?? null,
+          });
         }
 
         appendEvent('task.completed', 'task', taskId, {

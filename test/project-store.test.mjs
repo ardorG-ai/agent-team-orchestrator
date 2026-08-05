@@ -1087,11 +1087,19 @@ test('task completion and required outbox publication commit atomically', () => 
           messageId: 'candidate-ready',
           payload: { taskId: claim.taskId },
         },
+        taskEvent: {
+          type: 'candidate-finalized',
+          payload: { candidateOid: 'a'.repeat(40) },
+        },
       }),
       (error) => error instanceof OutboxBackpressureError,
     );
     assert.equal(store.getTask(task.taskId).state, 'running');
     assert.equal(store.getOutboxMessage('candidate-ready'), null);
+    assert.equal(
+      store.listEventLog().some((event) => event.kind === 'task.event.candidate-finalized'),
+      false,
+    );
 
     const [leased] = store.claimOutbox({ channel: 'review', consumer: 'reviewer' });
     assert.equal(leased.messageId, blocker.messageId);
@@ -1113,9 +1121,17 @@ test('task completion and required outbox publication commit atomically', () => 
         messageId: 'candidate-ready',
         payload: { taskId: claim.taskId },
       },
+      taskEvent: {
+        type: 'candidate-finalized',
+        payload: { candidateOid: 'a'.repeat(40) },
+      },
     });
     assert.equal(completed.task.state, 'completed');
     assert.equal(completed.outbox.messageId, 'candidate-ready');
+    assert.equal(
+      store.listEventLog().some((event) => event.kind === 'task.event.candidate-finalized'),
+      true,
+    );
   } finally {
     store.close();
     harness.cleanup();

@@ -78,7 +78,7 @@ test('buildTaskPrompt gives planner and read-only roles strict non-editing contr
   assert.doesNotMatch(reviewerPrompt, /Commit the finished change/);
 });
 
-test('buildTaskPrompt keeps commit requirements for standalone and build modes', () => {
+test('buildTaskPrompt keeps Git metadata controller-owned for standalone and build modes', () => {
   const standalone = buildTaskPrompt({
     payload: { title: 'Standalone change' },
     taskId: 'standalone-1',
@@ -92,6 +92,9 @@ test('buildTaskPrompt keeps commit requirements for standalone and build modes',
     taskId: 'builder-1',
   }, { generation: 1 });
 
-  assert.match(standalone, /Commit the finished change/);
-  assert.match(builder, /Commit the finished change/);
+  for (const prompt of [standalone, builder]) {
+    assert.match(prompt, /Do not run git add, git commit/i);
+    assert.match(prompt, /controller validates and commits them as the candidate/i);
+    assert.doesNotMatch(prompt, /Commit the finished change/);
+  }
 });

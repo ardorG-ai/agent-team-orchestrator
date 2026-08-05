@@ -6,7 +6,7 @@
 
 ```text
 Planner (read-only, strict team.plan.v1)
-  ├─ Builder (Codex by default, must create one clean candidate commit)
+  ├─ Builder (Codex by default, edits and verifies only within its scope)
   ├─ Researcher (Claude by default, read-only bounded report)
   └─ Test (Codex by default, read-only test analysis)
              ↓ all three completed
@@ -30,7 +30,7 @@ The Planner root is an ordinary fenced task. Its first attempt runs in a control
 
 Child tasks use the existing queue, leases, heartbeats, generation fencing, and daemon concurrency. When a child fails, queued descendants that depend on it fail with `dependency_failed` instead of remaining blocked forever. Once every direct child is terminal, the same transaction wakes the parent back to `queued`.
 
-The parent's second claim does not launch another CLI. The controller reads the five durable child records, validates the exact Builder candidate and structured gates, derives `READY_FOR_HUMAN` or `CHANGES_REQUESTED`, completes the parent, and writes one bounded review-channel delivery.
+After Builder succeeds, the controller—not the child CLI—validates its dirty paths and creates the isolated candidate commit. The parent's second claim does not launch another CLI. The controller reads the five durable child records, validates the exact Builder candidate and structured gates, derives `READY_FOR_HUMAN` or `CHANGES_REQUESTED`, completes the parent, and writes one bounded review-channel delivery.
 
 ## Failure recovery
 
@@ -56,7 +56,9 @@ Research and test reports are plain text capped at 12 KiB. Handoffs are controll
 
 - Every Agent receives an independent worktree and branch derived from task ID and generation.
 - Planner, Researcher, Test, Reviewer, and Verifier are read-only. A changed commit OID fails the task.
-- Builder must leave a clean worktree with a candidate OID different from its exact base OID.
+- Builder must leave only task-scoped working-tree changes and must not run `git add`, `git commit`, `git mv`, `git rm`, or any other index/ref-mutating command.
+- While the Builder lease is still current, the controller requires `HEAD` and the index to equal the exact base, validates tracked changes plus non-ignored untracked paths, recomputes the candidate tree before and after publication, creates one filter-free and hook-free candidate commit, performs another filter-free clean scan, and verifies its sole parent is that base.
+- Ignored files remain attempt-local runtime artifacts and are never included in the candidate.
 - Reviewer and Verifier start from the Builder's exact candidate OID, not a mutable branch name.
 - Child scopes cannot expand the operator's root scope. Empty report scopes inherit a non-empty root scope.
 - No stage merges, rebases, pushes, deletes a branch, deletes a worktree, or updates the protected ref.

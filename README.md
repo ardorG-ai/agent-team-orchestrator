@@ -42,7 +42,7 @@ Create tasks from the GUI or another terminal. The daemon automatically claims r
 ```bash
 node bin/agent-team.mjs task add \
   --title "Implement the first vertical slice" \
-  --description "Build, test, and commit the smallest end-to-end slice" \
+  --description "Build, test, and produce the smallest reviewable candidate" \
   --adapter codex \
   --idempotency-key first-slice
 
@@ -64,7 +64,7 @@ The Planner is read-only and may return only the strict `team.plan.v1` contract.
 
 ```text
 Planner
-  ├─ Builder      (candidate commit)
+  ├─ Builder      (scoped edits; controller creates candidate commit)
   ├─ Researcher   (read-only evidence report)
   └─ Test         (read-only test analysis)
          ↓ barrier
@@ -123,7 +123,7 @@ node bin/agent-team.mjs init
 
 node bin/agent-team.mjs task add \
   --title "Implement the first vertical slice" \
-  --description "Build, test, and commit the smallest end-to-end slice" \
+  --description "Build, test, and produce the smallest reviewable candidate" \
   --adapter codex \
   --idempotency-key first-slice
 

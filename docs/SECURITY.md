@@ -42,15 +42,19 @@ This is the key constraint that keeps prompt injection, hallucinated memory, and
 - Planner output selects bounded objectives and scopes inside a controller-fixed five-child graph; it cannot add roles or arbitrary dependencies.
 - A non-empty operator scope is an upper bound. Empty Researcher/Test scopes inherit it instead of expanding to the repository.
 - Planner, Researcher, Test, Reviewer, and Verifier worktrees are read-only at the Git snapshot boundary.
+- Builder and standalone child CLIs may edit only task-scoped files but may not run index- or ref-mutating commands such as `git add`, `git commit`, `git mv`, or `git rm`. Git metadata is controller-owned because linked-worktree indexes live under the protected common `.git` directory; any staged index delta fails closed.
+- Before publishing a mutable result, the controller requires `HEAD` and the linked-worktree index to equal the exact base, validates tracked changes plus non-ignored untracked paths against the task scope, hashes file bytes without Git attributes/clean filters, recomputes the candidate tree both before and after publication, uses hook-disabled Git plumbing, and performs a second filter-free clean snapshot before completion.
+- Ignored files are intentionally excluded from candidate publication and clean-snapshot decisions. They are local runtime artifacts, even when an Agent writes them inside its worktree.
 - Reviewer and Verifier resolve the exact completed Builder candidate OID through the store and must belong to the same parent.
 - Handoffs expose only allowlisted result fields, are capped at 12 KiB, and are labeled untrusted in the receiving prompt.
 - Reviewer/Verifier JSON rejects unknown fields. A verification `PASS` must contain every required check as a unique passing receipt.
 - Failed dependencies terminalize queued descendants; a failed lane cannot silently leave the parent waiting forever.
 - The final team verdict is derived by controller code. Agent text cannot directly mark the parent ready or update a Git ref.
+- Candidate creation never runs repository-defined clean filters or hooks, merges, pushes, updates a protected ref, deletes a branch, or deletes a worktree. Failed, backpressured, or lease-lost candidate objects remain isolated on managed attempt branches and are not recorded as finalized unless task completion commits atomically.
 
 ## Auth reuse
 
-Codex and Claude adapters may reuse the operator's existing CLI authentication through an explicit, narrow environment/config allowlist. The orchestrator never copies credentials into its database, event log, task prompt, or artifacts.
+Codex and Claude adapters may reuse the operator's existing CLI authentication through an explicit, narrow environment/config allowlist. Claude non-interactive runs add `--safe-mode --no-session-persistence` so ambient `CLAUDE.md`, skills, plugins, hooks, MCP servers, custom agents, and resumable sessions cannot silently widen a fenced task. The orchestrator never copies credentials into its database, event log, task prompt, or artifacts.
 
 ## Local GUI boundary
 

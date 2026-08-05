@@ -95,6 +95,33 @@ test('runClaude reports terminal failure on nonzero exit', async () => {
   assert.match(result.terminal.message, /adapter failure/);
 });
 
+test('runClaude uses isolated print argv without disabling built-in tools', async () => {
+  const result = await runClaude({
+    cwd: path.dirname(fixturePath),
+    env: {
+      AGENT_SCENARIO: 'success',
+    },
+    envAllowlist: fakeEnvAllowlist,
+    executable: process.execPath,
+    launcherArgs: [fixturePath],
+    prompt: 'ship it',
+    timeoutMs: 2_000,
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.args, [
+    fixturePath,
+    '-p',
+    '--safe-mode',
+    '--no-session-persistence',
+    '--verbose',
+    '--output-format',
+    'stream-json',
+    '--permission-mode',
+    'acceptEdits',
+  ]);
+});
+
 test('runSubprocess enforces timeout', async () => {
   const result = await runSubprocess({
     command: process.execPath,
@@ -175,6 +202,20 @@ test('runSubprocess absorbs stdin EPIPE when a child exits before reading input'
   assert.equal(result.exitCode, 9);
   assert.equal(result.success, false);
   if (result.stdinError) assert.match(result.stdinError.code ?? '', /EPIPE|ERR_STREAM_DESTROYED/);
+});
+
+test('runSubprocess preserves binary Buffer stdin without string coercion', async () => {
+  const input = Buffer.from([0x00, 0xff, 0x41, 0x0a]);
+  const result = await runSubprocess({
+    command: process.execPath,
+    args: ['-e', "const chunks=[];process.stdin.on('data',(chunk)=>chunks.push(chunk));process.stdin.on('end',()=>process.stdout.write(Buffer.concat(chunks).toString('hex')));"],
+    cwd: path.dirname(fixturePath),
+    input,
+    timeoutMs: 2_000,
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.stdout, input.toString('hex'));
 });
 
 test('adapter rejects a terminal success event when prompt delivery fails', async () => {

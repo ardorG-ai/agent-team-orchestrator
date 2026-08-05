@@ -26,7 +26,7 @@ function modeRequirements(executionMode) {
       ...common.slice(0, 3),
       '- Run the relevant tests and static checks.',
       common[3],
-      '- Commit the finished change before returning. The controller accepts only a clean worktree and records the exact candidate commit OID.',
+      '- Do not run git add, git commit, git mv, git rm, or any command that changes the Git index or refs. Leave only task-scoped working-tree changes in place; after a successful run the controller validates and commits them as the candidate.',
       common[4],
     ].join('\n');
   }
@@ -36,7 +36,7 @@ function modeRequirements(executionMode) {
       ...common.slice(0, 3),
       '- Run the relevant tests and static checks.',
       common[3],
-      '- Commit the finished change before returning. The controller accepts only a clean worktree with a new candidate commit OID.',
+      '- Do not run git add, git commit, git mv, git rm, or any command that changes the Git index or refs. Leave only task-scoped working-tree changes in place; after a successful run the controller validates and commits them as the candidate.',
       common[4],
     ].join('\n');
   }
@@ -90,7 +90,7 @@ A PASS verdict requires at least one check, must not contain a failed check, and
     return 'Return a concise plain-text report of evidence, constraints, commands run, and remaining uncertainty. Keep it below 12 KiB and do not claim that you changed the repository.';
   }
 
-  return 'Summarize changed files, verification performed, remaining risks, and the resulting commit OID.';
+  return 'Summarize changed files, verification performed, and remaining risks. The controller records the resulting candidate commit OID after validating your working-tree changes.';
 }
 
 export function buildTaskPrompt(task, claim, context = {}) {

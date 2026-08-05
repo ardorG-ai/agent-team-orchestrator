@@ -461,8 +461,8 @@ export function assertExecutionSnapshot(executionMode, snapshot, baseOid) {
   if (READ_ONLY_MODES.has(executionMode) && candidateOid !== exactBaseOid) {
     throw new Error(`${executionMode} execution must not modify or commit in its worktree`);
   }
-  if (executionMode === 'build' && candidateOid === exactBaseOid) {
-    throw new Error('build execution must produce a new candidate commit');
+  if ((executionMode === 'standalone' || executionMode === 'build') && candidateOid === exactBaseOid) {
+    throw new Error(`${executionMode} execution must produce a new candidate commit`);
   }
 
   return candidateOid;

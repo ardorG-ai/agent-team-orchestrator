@@ -39,7 +39,7 @@ Heartbeat, completion, failure, task-scoped outbox writes, and worktree publicat
 
 ## Transactional outbox
 
-A control-plane transition and its audit/outbox records are committed together. Producers never publish externally first and repair state afterward.
+A control-plane transition and its audit/outbox records are committed together. For mutable tasks, the signed `candidate-finalized` receipt is appended inside the same SQLite transaction that stores the result, completes the task, and enqueues any required review delivery. Outbox backpressure rolls back that receipt and requeues the task; it cannot leave a queued task claiming that a candidate was finalized. Producers never publish externally first and repair state afterward.
 
 Channels are bounded. Capacity is checked inside the same write transaction used to enqueue. Full channels return explicit backpressure rather than dropping or overwriting messages.
 
@@ -51,7 +51,7 @@ Project Brain events use the same chain. Asset and loadout events record non-bod
 
 ## Git model
 
-Each attempt uses a branch and worktree derived from task ID and generation, created from an exact base commit OID. Team Reviewer and Verifier attempts resolve their base from the completed Builder task's exact candidate OID. The current branch can inspect and record a clean candidate commit but cannot merge, update the target ref, delete a branch, or delete a worktree.
+Each attempt uses a branch and worktree derived from task ID and generation, created from an exact base commit OID. Mutable child CLIs edit and verify files but do not own Git metadata. After a successful mutable run, the controller requires `HEAD` and the linked-worktree index to remain at the exact base, inventories tracked changes plus non-ignored untracked paths, rejects any path outside the task scope, and creates one candidate through filter-free, hook-free Git plumbing. It computes the candidate tree twice before publication, recomputes it after the compare-and-swap ref update, then performs another filter-free clean scan. Ignored files are treated as local runtime artifacts and never enter a candidate. The controller then requires a non-base candidate OID with exactly one parent equal to the recorded base. Team Reviewer and Verifier attempts resolve their base from that completed Builder candidate OID. No execution path merges, pushes, updates the protected ref, deletes a branch, or deletes a worktree.
 
 ## Project Brain model
 
@@ -81,7 +81,7 @@ See [Automatic Agent team workflow](TEAM-WORKFLOW.md).
 
 ## Adapter model
 
-Adapters translate provider-specific streams into normalized events. Codex stdout is JSONL from `codex exec --json`; Claude stdout is stream JSON from `claude -p --verbose --output-format stream-json`. Stderr remains diagnostic data. Raw Agent text never controls task status or paths.
+Adapters translate provider-specific streams into normalized events. Codex stdout is JSONL from `codex exec --json`; Claude stdout is stream JSON from `claude -p --safe-mode --no-session-persistence --verbose --output-format stream-json`. Claude safe mode excludes ambient project/user customization layers while preserving authentication, built-in tools, model selection, and the controller-supplied prompt. Stderr remains diagnostic data. Raw Agent text never controls task status or paths.
 
 Only explicitly allowlisted environment keys can reach an adapter. Controller-owned values such as the worktree cwd, prompt, and abort signal cannot be overridden by adapter-specific options.
 
