@@ -11,6 +11,8 @@
     "node": ">=22.16.0"
   },
   "scripts": {
+    "daemon": "node bin/agent-team.mjs daemon",
+    "gui": "node bin/agent-team.mjs gui",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.mjs",
     "test:stress": "node --disable-warning=ExperimentalWarning --test test/stress/*.test.mjs",
     "check": "node scripts/check.mjs"

@@ -159,6 +159,95 @@ test('worker run command delegates with the project store and runtime options', 
   assert.equal(captured.context.repoRoot, realpathSync(repo));
 });
 
+test('gui command initializes channels and owns the server lifecycle', async () => {
+  const { repo, stateRoot } = createRepository();
+  let captured;
+  let serverClosed = false;
+
+  const result = await executeCli([
+    'gui',
+    '--host', '127.0.0.1',
+    '--port', '4321',
+    ...projectArgs(repo, stateRoot),
+  ], {
+    startGuiServerFn: async (options) => {
+      captured = options;
+      return {
+        async close() {
+          serverClosed = true;
+        },
+        host: options.host,
+        port: options.port,
+        url: `http://${options.host}:${options.port}`,
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.url, 'http://127.0.0.1:4321');
+  assert.equal(captured.context.repoRoot, realpathSync(repo));
+  assert.deepEqual(captured.store.listChannels().map((entry) => entry.channel), [
+    'builder',
+    'control',
+    'review',
+  ]);
+
+  await result.close();
+  assert.equal(serverClosed, true);
+});
+
+test('daemon command initializes channels, starts the scheduler, and owns the lifecycle', async () => {
+  const { repo, stateRoot } = createRepository();
+  let captured;
+  let daemonClosed = false;
+
+  const result = await executeCli([
+    'daemon',
+    '--host', '127.0.0.1',
+    '--port', '4318',
+    '--poll-ms', '250',
+    '--lease-ms', '5000',
+    '--timeout-ms', '9000',
+    '--concurrency', '3',
+    ...projectArgs(repo, stateRoot),
+  ], {
+    startDaemonFn: async (options) => {
+      captured = options;
+      return {
+        async close() {
+          daemonClosed = true;
+        },
+        host: options.host,
+        port: options.port,
+        status: {
+          concurrency: options.concurrency,
+          leaseMs: options.leaseMs,
+          pollMs: options.pollMs,
+          timeoutMs: options.timeoutMs,
+        },
+        url: `http://${options.host}:${options.port}`,
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.url, 'http://127.0.0.1:4318');
+  assert.equal(result.concurrency, 3);
+  assert.equal(result.pollMs, 250);
+  assert.equal(result.leaseMs, 5000);
+  assert.equal(result.timeoutMs, 9000);
+  assert.equal(captured.timeoutMs, 9000);
+  assert.equal(captured.context.repoRoot, realpathSync(repo));
+  assert.deepEqual(captured.store.listChannels().map((entry) => entry.channel), [
+    'builder',
+    'control',
+    'review',
+  ]);
+
+  await result.close();
+  assert.equal(daemonClosed, true);
+});
+
 test('task add rejects scheduler flags that v0.1 does not enforce', async () => {
   const { repo, stateRoot } = createRepository();
   await executeCli(['init', ...projectArgs(repo, stateRoot)]);
@@ -178,5 +267,6 @@ test('task add rejects scheduler flags that v0.1 does not enforce', async () => 
 test('help does not advertise deferred scheduler flags', async () => {
   const help = await executeCli(['--help']);
   assert.doesNotMatch(help, /--priority|--max-attempts/);
+  assert.match(help, /agent-team daemon/);
   assert.equal(await executeCli(['--version']), '0.1.1');
 });

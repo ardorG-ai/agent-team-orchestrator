@@ -10,6 +10,8 @@
 - Exact-OID worktree preparation
 - Codex and Claude non-interactive adapters
 - CLI, tests, doctor, and JSON output
+- Loopback-only local team GUI
+- Resident daemon with bounded worker slots and graceful shutdown
 
 ## v0.2 — review transaction
 
@@ -22,11 +24,12 @@
 
 ## v0.3 — self-improvement loop
 
-- Scheduler daemon with fairness across role channels
+- Fair scheduling across role channels
 - Retry budgets and dead-letter inspection
 - Dev-branch dogfooding workflow
 - Automated architecture/test/security critique gates
 - Release candidate promotion from `dev` to `main`
+- Optional native desktop wrapper and operating-system auto-start
 
 ## v0.4 — governed memory
 

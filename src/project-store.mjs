@@ -1494,6 +1494,36 @@ export function openProjectStore(options) {
       return rowToOutboxMessage(getOutboxRowById(messageId));
     },
 
+    listOutbox(filters = {}) {
+      const clauses = [];
+      const params = [];
+
+      if (filters.channel) {
+        requireString('channel', filters.channel);
+        clauses.push('channel = ?');
+        params.push(filters.channel);
+      }
+      if (filters.state) {
+        requireString('state', filters.state);
+        clauses.push('state = ?');
+        params.push(filters.state);
+      }
+
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const limit = filters.limit ?? 100;
+      requirePositiveInteger('limit', limit);
+
+      return prepare(
+        `SELECT *
+         FROM outbox
+         ${where}
+         ORDER BY created_at, message_id
+         LIMIT ?`,
+      )
+        .all(...params, limit)
+        .map(rowToOutboxMessage);
+    },
+
     getEventHead() {
       const { head, headJson, headSignature } = getHeadMetadata();
       return {

@@ -3,6 +3,9 @@ export const HELP = `Agent Team Orchestrator v0.1
 Usage:
   agent-team init [--repo PATH] [--state-root PATH] [--json]
   agent-team doctor [--repo PATH] [--state-root PATH] [--json]
+  agent-team gui [--repo PATH] [--state-root PATH] [--host 127.0.0.1] [--port 4317]
+  agent-team daemon [--repo PATH] [--state-root PATH] [--host 127.0.0.1] [--port 4317]
+                    [--poll-ms N] [--lease-ms N] [--timeout-ms N] [--concurrency N]
 
   agent-team task add --title TEXT [--description TEXT] [--adapter codex|claude]
                       [--depends ID[,ID...]] [--scope PATH[,PATH...]]
@@ -40,5 +43,8 @@ Usage:
   agent-team events verify [--json]
 
 Safety:
+  The GUI binds to loopback only and keeps worker fences inside the controller.
+  The daemon binds to loopback only, reuses runWorkerOnce as the sole execution boundary,
+  and stops gracefully on SIGINT/SIGTERM without auto-merging or cleaning up worktrees.
   v0.1 does not merge, update target refs, delete worktrees, or delete branches.
 `;

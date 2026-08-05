@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Agent Team</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell" id="app-shell">
+      <aside class="side-nav" aria-label="主导航">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true">AT</div>
+          <div>
+            <div class="brand-name">Agent Team</div>
+            <div class="brand-subtitle">local control plane</div>
+          </div>
+        </div>
+
+        <nav class="nav-list" aria-label="控制台页面">
+          <button class="nav-item is-active" type="button" data-view="tasks" aria-label="团队工作台" aria-current="page">
+            <span class="nav-code" aria-hidden="true">01</span>
+            <span>团队工作台</span>
+          </button>
+          <button class="nav-item" type="button" data-view="review" aria-label="审核队列">
+            <span class="nav-code" aria-hidden="true">02</span>
+            <span>审核队列</span>
+            <span class="nav-count" id="review-nav-count">0</span>
+          </button>
+          <button class="nav-item" type="button" data-view="events" aria-label="事件审计">
+            <span class="nav-code" aria-hidden="true">03</span>
+            <span>事件审计</span>
+          </button>
+        </nav>
+
+        <section class="agent-roster-shell" aria-labelledby="agent-roster-heading">
+          <div class="sidebar-section-heading">
+            <span id="agent-roster-heading">Agent team</span>
+            <span id="agent-active-count">0 active</span>
+          </div>
+          <div class="agent-roster" id="agent-roster"></div>
+        </section>
+
+        <div class="nav-spacer"></div>
+
+        <div class="control-health" id="control-health" aria-live="polite">
+          <span class="health-indicator" aria-hidden="true"></span>
+          <div>
+            <strong>正在连接</strong>
+            <span>SQLite control plane</span>
+          </div>
+        </div>
+
+        <button class="theme-toggle" id="theme-toggle" type="button" aria-label="切换颜色主题">
+          <span>主题</span>
+          <span id="theme-label">自动</span>
+        </button>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="project-heading">
+            <div class="project-kicker">当前项目</div>
+            <div class="project-title-row">
+              <h1 id="project-name">正在载入</h1>
+              <span class="branch-chip" id="project-branch">git</span>
+            </div>
+            <p id="project-path">正在读取本地控制面</p>
+          </div>
+          <div class="topbar-actions">
+            <button class="button button-secondary" id="refresh-button" type="button">刷新</button>
+            <button class="button button-primary" id="new-task-button" type="button">新建任务</button>
+          </div>
+        </header>
+
+        <section class="view is-active" data-view-panel="tasks" aria-labelledby="tasks-heading">
+          <div class="pulse-strip" aria-label="团队状态概览">
+            <div class="pulse-cell">
+              <span>待执行</span>
+              <strong id="metric-queued">0</strong>
+              <small>ready tasks</small>
+            </div>
+            <div class="pulse-cell">
+              <span>运行中</span>
+              <strong id="metric-running">0</strong>
+              <small>active leases</small>
+            </div>
+            <div class="pulse-cell">
+              <span>待审核</span>
+              <strong id="metric-review">0</strong>
+              <small>channel depth</small>
+            </div>
+            <div class="pulse-cell">
+              <span>事件链</span>
+              <strong id="metric-events">0</strong>
+              <small id="metric-integrity">checking</small>
+            </div>
+          </div>
+
+          <button class="working-bar" id="working-bar" type="button" aria-label="查看团队动态">
+            <span class="working-avatar-stack" id="working-avatar-stack" aria-hidden="true"></span>
+            <span class="working-copy">
+              <strong id="working-title">团队正在连接</strong>
+              <span id="working-detail">等待本地控制面快照</span>
+            </span>
+            <span class="working-action">查看动态</span>
+          </button>
+
+          <div class="workbench-grid">
+            <section class="board-panel" aria-labelledby="tasks-heading">
+              <div class="section-heading">
+                <div>
+                  <span class="section-kicker">Work queue</span>
+                  <h2 id="tasks-heading">任务工作台</h2>
+                  <p>每个任务都是一条独立工作线程，带 Agent、角色、租约、worktree 与候选提交。</p>
+                </div>
+                <div class="segmented-filter" role="group" aria-label="任务筛选">
+                  <button type="button" class="is-active" data-filter="all">全部</button>
+                  <button type="button" data-filter="attention">需处理</button>
+                  <button type="button" data-filter="active">进行中</button>
+                </div>
+              </div>
+
+              <div class="loading-board" id="loading-board" aria-label="任务正在加载">
+                <div class="skeleton-line skeleton-wide"></div>
+                <div class="skeleton-line"></div>
+                <div class="skeleton-line skeleton-mid"></div>
+              </div>
+
+              <div class="task-board" id="task-board" hidden></div>
+
+              <div class="empty-state" id="tasks-empty" hidden>
+                <strong>队列现在是空的</strong>
+                <p>创建一个有明确范围和验收条件的任务，让 Codex 或 Claude 接手。</p>
+                <button class="button button-primary" type="button" data-open-new-task>新建任务</button>
+              </div>
+            </section>
+
+            <aside class="activity-panel" id="activity-panel" aria-labelledby="activity-heading">
+              <div class="activity-panel-header">
+                <div>
+                  <span class="section-kicker">Signed activity</span>
+                  <h2 id="activity-heading">团队动态</h2>
+                </div>
+                <span class="live-chip"><span aria-hidden="true"></span> polling</span>
+              </div>
+              <ol class="activity-feed" id="activity-feed"></ol>
+              <div class="activity-empty" id="activity-empty" hidden>
+                控制面事件会在这里转成可读的协作动态；原始签名记录仍保留在事件审计。
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="review" aria-labelledby="review-heading" hidden>
+          <div class="section-heading compact-heading">
+            <div>
+              <h2 id="review-heading">审核队列</h2>
+              <p>候选提交来自事务性 outbox。这里只读取，不会自动更新分支。</p>
+            </div>
+          </div>
+          <div class="channel-grid" id="channel-grid"></div>
+          <div class="review-list" id="review-list"></div>
+          <div class="empty-state" id="review-empty" hidden>
+            <strong>没有等待审核的候选</strong>
+            <p>Worker 完成任务后，候选 OID 会原子写入 review 频道。</p>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="events" aria-labelledby="events-heading" hidden>
+          <div class="section-heading compact-heading">
+            <div>
+              <h2 id="events-heading">事件审计</h2>
+              <p>签名事件按序展示。完整性检查失败时，控制台不会将状态标记为健康。</p>
+            </div>
+            <button class="button button-secondary" id="verify-button" type="button">重新验证</button>
+          </div>
+          <div class="integrity-banner" id="integrity-banner">
+            <span class="integrity-symbol" aria-hidden="true">...</span>
+            <div>
+              <strong>正在验证事件链</strong>
+              <p>校验 SQLite、哈希链、HMAC 签名和签名头。</p>
+            </div>
+          </div>
+          <ol class="event-timeline" id="event-timeline"></ol>
+        </section>
+      </main>
+
+      <aside class="inspector" id="inspector" aria-label="任务检查器">
+        <div class="inspector-empty" id="inspector-empty">
+          <span class="inspector-index">TASK</span>
+          <strong>选择一个任务</strong>
+          <p>这里会显示精确 base OID、租约代次、依赖、工作树和候选提交。</p>
+        </div>
+        <div id="inspector-content" hidden></div>
+      </aside>
+    </div>
+
+    <dialog class="task-dialog" id="task-dialog" aria-labelledby="task-dialog-title">
+      <form id="task-form" method="dialog">
+        <div class="dialog-header">
+          <div>
+            <span class="dialog-kicker">New work unit</span>
+            <h2 id="task-dialog-title">创建任务</h2>
+          </div>
+          <button class="icon-button" type="button" id="close-task-dialog" aria-label="关闭">关闭</button>
+        </div>
+
+        <div class="form-grid">
+          <label class="field field-span">
+            <span>任务标题</span>
+            <input name="title" required maxlength="160" autocomplete="off">
+          </label>
+
+          <label class="field field-span">
+            <span>任务描述</span>
+            <textarea name="description" rows="5" maxlength="8000" placeholder="说明目标、验收条件和禁止事项"></textarea>
+          </label>
+
+          <label class="field">
+            <span>Agent</span>
+            <select name="adapter">
+              <option value="codex">Codex CLI</option>
+              <option value="claude">Claude Code CLI</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>角色</span>
+            <select name="role">
+              <option value="builder">Builder</option>
+              <option value="reviewer">Reviewer</option>
+              <option value="verifier">Verifier</option>
+              <option value="architect">Architect</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>基础分支或 OID</span>
+            <input name="base" value="dev" maxlength="200" autocomplete="off">
+          </label>
+
+          <label class="field">
+            <span>Review 频道</span>
+            <input name="channel" value="review" maxlength="80" autocomplete="off">
+          </label>
+
+          <label class="field field-span">
+            <span>允许范围</span>
+            <input name="scope" maxlength="4000" placeholder="src/gui-server.mjs, web/">
+            <small>多个路径使用逗号分隔。留空表示整个任务 worktree。</small>
+          </label>
+
+          <label class="field field-span">
+            <span>依赖任务</span>
+            <input name="dependencies" maxlength="4000" placeholder="task-id-1, task-id-2">
+          </label>
+
+          <label class="field field-span">
+            <span>幂等键</span>
+            <input name="idempotencyKey" required maxlength="240" autocomplete="off">
+            <small>重复提交相同键和相同内容时安全重放。</small>
+          </label>
+        </div>
+
+        <div class="dialog-error" id="dialog-error" role="alert" hidden></div>
+
+        <div class="dialog-actions">
+          <button class="button button-secondary" type="button" id="cancel-task-dialog">取消</button>
+          <button class="button button-primary" type="submit" id="create-task-submit">写入队列</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>

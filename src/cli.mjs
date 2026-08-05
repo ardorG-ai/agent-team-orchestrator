@@ -12,7 +12,9 @@ import {
   parseArgv,
 } from './argv.mjs';
 import { runDoctor } from './doctor.mjs';
+import { startDaemon } from './daemon.mjs';
 import { AgentTeamError, errorPayload } from './errors.mjs';
+import { startGuiServer } from './gui-server.mjs';
 import { HELP } from './help.mjs';
 import { runWorkerOnce } from './orchestrator.mjs';
 import { safeText, writeResult } from './output.mjs';
@@ -229,6 +231,8 @@ export async function executeCli(argv, options = {}) {
     runDoctorFn: options.runDoctorFn ?? runDoctor,
     runWorkerOnceFn: options.runWorkerOnceFn ?? runWorkerOnce,
     snapshotWorktreeFn: options.snapshotWorktreeFn ?? snapshotWorktree,
+    startDaemonFn: options.startDaemonFn ?? startDaemon,
+    startGuiServerFn: options.startGuiServerFn ?? startGuiServer,
   };
   const parsed = parseArgv(argv);
 
@@ -268,6 +272,129 @@ export async function executeCli(argv, options = {}) {
     return withProjectStore(parsed, dependencies, async ({ context, store }) => (
       dependencies.runDoctorFn(context, store)
     ));
+  }
+
+  if (parsed.positionals[0] === 'gui') {
+    const repoRoot = dependencies.ensureGitRepositoryFn(repositoryPath(parsed, dependencies.cwd));
+    const context = dependencies.projectContextFn(repoRoot, contextOptions(parsed));
+    const store = dependencies.openProjectStoreFn({
+      dbPath: context.dbPath,
+      secretKeyPath: context.keyPath,
+    });
+
+    let gui;
+    try {
+      for (const channel of DEFAULT_CHANNELS) {
+        if (!store.getChannel(channel.channel)) store.configureChannel(channel);
+      }
+      gui = await dependencies.startGuiServerFn({
+        context,
+        host: optionalStringFlag(parsed, 'host', '127.0.0.1'),
+        port: integerFlag(parsed, 'port', 4317, { min: 0, max: 65_535 }),
+        store,
+      });
+    } catch (error) {
+      store.close();
+      throw error;
+    }
+
+    let closed = false;
+    const close = async () => {
+      if (closed) return;
+      closed = true;
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+      try {
+        await gui.close();
+      } finally {
+        store.close();
+      }
+    };
+    const onSignal = () => {
+      void close();
+    };
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+
+    const result = {
+      host: gui.host,
+      ok: true,
+      port: gui.port,
+      repoRoot: context.repoRoot,
+      url: gui.launchUrl ?? gui.url,
+    };
+    Object.defineProperty(result, 'close', {
+      enumerable: false,
+      value: close,
+    });
+    return result;
+  }
+
+  if (parsed.positionals[0] === 'daemon') {
+    const repoRoot = dependencies.ensureGitRepositoryFn(repositoryPath(parsed, dependencies.cwd));
+    const context = dependencies.projectContextFn(repoRoot, contextOptions(parsed));
+    const store = dependencies.openProjectStoreFn({
+      dbPath: context.dbPath,
+      secretKeyPath: context.keyPath,
+    });
+
+    let daemon;
+    try {
+      for (const channel of DEFAULT_CHANNELS) {
+        if (!store.getChannel(channel.channel)) store.configureChannel(channel);
+      }
+      daemon = await dependencies.startDaemonFn({
+        concurrency: integerFlag(parsed, 'concurrency', 1, { min: 1, max: 64 }),
+        context,
+        host: optionalStringFlag(parsed, 'host', '127.0.0.1'),
+        leaseMs: integerFlag(parsed, 'lease-ms', 30_000, { min: 100, max: 60 * 60_000 }),
+        pollMs: integerFlag(parsed, 'poll-ms', 1_000, { min: 50, max: 60_000 }),
+        port: integerFlag(parsed, 'port', 4317, { min: 0, max: 65_535 }),
+        runWorkerOnce: dependencies.runWorkerOnceFn,
+        startGuiServer: dependencies.startGuiServerFn,
+        store,
+        timeoutMs: integerFlag(parsed, 'timeout-ms', 30 * 60_000, { min: 1, max: 24 * 60 * 60_000 }),
+      });
+    } catch (error) {
+      store.close();
+      throw error;
+    }
+
+    let closed = false;
+    const close = async () => {
+      if (closed) return;
+      closed = true;
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+      try {
+        await daemon.close();
+      } finally {
+        store.close();
+      }
+    };
+    const onSignal = () => {
+      void close();
+    };
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+
+    const result = {
+      concurrency: daemon.status?.concurrency ?? integerFlag(parsed, 'concurrency', 1, { min: 1, max: 64 }),
+      host: daemon.host,
+      leaseMs: daemon.status?.leaseMs ?? integerFlag(parsed, 'lease-ms', 30_000, { min: 100, max: 60 * 60_000 }),
+      ok: true,
+      pollMs: daemon.status?.pollMs ?? integerFlag(parsed, 'poll-ms', 1_000, { min: 50, max: 60_000 }),
+      port: daemon.port,
+      repoRoot: context.repoRoot,
+      timeoutMs: daemon.status?.timeoutMs
+        ?? integerFlag(parsed, 'timeout-ms', 30 * 60_000, { min: 1, max: 24 * 60 * 60_000 }),
+      url: daemon.url,
+    };
+    Object.defineProperty(result, 'close', {
+      enumerable: false,
+      value: close,
+    });
+    return result;
   }
 
   if (command === 'task add') {
