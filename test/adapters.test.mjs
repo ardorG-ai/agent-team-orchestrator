@@ -31,6 +31,12 @@ async function waitFor(predicate, timeoutMs = 2_000) {
   throw new Error('Timed out waiting for condition');
 }
 
+function blockEventLoop(ms) {
+  const shared = new SharedArrayBuffer(4);
+  const view = new Int32Array(shared);
+  Atomics.wait(view, 0, 0, ms);
+}
+
 test('parseJsonlFragments handles chunked JSONL input', () => {
   const parsed = parseJsonlFragments([
     '{"type":"session.created","session_id":"sess-1"}\n{"type":"assistant","message":{"content":[{"text":"hel',
@@ -154,6 +160,55 @@ test('runSubprocess enforces timeout', async () => {
 
   assert.equal(result.timedOut, true);
   assert.equal(result.success, false);
+  assert.equal(result.terminationReason, 'timeout');
+});
+
+test('runSubprocess does not count a single event-loop stall as the full timeout budget', async () => {
+  const runPromise = runSubprocess({
+    command: process.execPath,
+    args: [fixturePath],
+    cwd: path.dirname(fixturePath),
+    env: {
+      AGENT_SCENARIO: 'sleep',
+      FAKE_AGENT_SLEEP_MS: '25',
+    },
+    envAllowlist: fakeEnvAllowlist,
+    timeoutMs: 50,
+    maxStdoutBytes: 4096,
+    maxStderrBytes: 4096,
+  });
+
+  blockEventLoop(150);
+
+  const result = await runPromise;
+  assert.equal(result.success, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.terminationReason, null);
+});
+
+test('runSubprocess still times out through repeated event-loop stalls', async () => {
+  const runPromise = runSubprocess({
+    command: process.execPath,
+    args: [fixturePath],
+    cwd: path.dirname(fixturePath),
+    env: {
+      AGENT_SCENARIO: 'sleep',
+      FAKE_AGENT_SLEEP_MS: '500',
+    },
+    envAllowlist: fakeEnvAllowlist,
+    timeoutMs: 50,
+    maxStdoutBytes: 4096,
+    maxStderrBytes: 4096,
+  });
+
+  for (let iteration = 0; iteration < 8; iteration += 1) {
+    blockEventLoop(30);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const result = await runPromise;
+  assert.equal(result.success, false);
+  assert.equal(result.timedOut, true);
   assert.equal(result.terminationReason, 'timeout');
 });
 

@@ -70,6 +70,10 @@ function delay(ms) {
   });
 }
 
+function monotonicNowMs() {
+  return Number(process.hrtime.bigint()) / 1e6;
+}
+
 function hasPosixProcessGroup(groupId) {
   if (!groupId || process.platform === 'win32') {
     return false;
@@ -272,15 +276,42 @@ export async function runSubprocess(options) {
     signal.addEventListener('abort', abortHandler, { once: true });
   }
 
-  const timeoutId = timeoutMs > 0
-    ? setTimeout(() => {
-        if (aborted) {
+  const timeoutTickMs = timeoutMs > 0
+    ? Math.max(10, Math.min(100, Math.floor(timeoutMs / 4) || 10))
+    : 0;
+  const timeoutGapThresholdMs = timeoutTickMs > 0
+    ? Math.max(timeoutTickMs * 2, 20)
+    : 0;
+  let timeoutBudgetMs = 0;
+  let lastTimeoutCheckMs = monotonicNowMs();
+  const timeoutIntervalId = timeoutMs > 0
+    ? setInterval(() => {
+        if (aborted || timedOut || settled) {
+          lastTimeoutCheckMs = monotonicNowMs();
           return;
         }
+
+        const currentMs = monotonicNowMs();
+        const elapsedMs = Math.max(currentMs - lastTimeoutCheckMs, 0);
+        lastTimeoutCheckMs = currentMs;
+
+        // A suspended host produces one overdue watchdog tick. Charge that tick,
+        // not the whole sleep gap, while repeated stalls still consume budget.
+        const billableElapsedMs = elapsedMs > timeoutGapThresholdMs
+          ? Math.min(elapsedMs, timeoutTickMs)
+          : elapsedMs;
+        timeoutBudgetMs += billableElapsedMs;
+
+        if (timeoutBudgetMs < timeoutMs) {
+          return;
+        }
+
         timedOut = true;
         void ensureProcessTreeTerminated();
-      }, timeoutMs)
+      }, timeoutTickMs)
     : null;
+
+  timeoutIntervalId?.unref?.();
 
   const result = await new Promise((resolve, reject) => {
     child.once('error', (error) => {
@@ -318,8 +349,8 @@ export async function runSubprocess(options) {
 
     child.stdin.end(inputBuffer);
   }).finally(() => {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
+    if (timeoutIntervalId) {
+      clearInterval(timeoutIntervalId);
     }
     if (signal) {
       signal.removeEventListener('abort', abortHandler);
