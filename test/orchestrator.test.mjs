@@ -1363,10 +1363,30 @@ test('runWorkerOnce rejects root-level dynamic base and handoff references befor
   }
 });
 
-test('runWorkerOnce constrains Claude researcher tools without blocking test checks', async () => {
+test('runWorkerOnce applies Claude tool loadouts by read-only role', async () => {
   const cases = [
-    { role: 'researcher', expectedTools: ['Read', 'Grep', 'Glob'] },
-    { role: 'test', expectedTools: undefined },
+    {
+      executionMode: 'report',
+      expectedTools: ['Read', 'Grep', 'Glob'],
+      finalMessage: 'Bounded research report.',
+      role: 'researcher',
+    },
+    {
+      executionMode: 'review',
+      expectedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+      finalMessage: JSON.stringify({
+        schema: 'team.review.v1',
+        verdict: 'APPROVED',
+        findings: [],
+      }),
+      role: 'reviewer',
+    },
+    {
+      executionMode: 'report',
+      expectedTools: undefined,
+      finalMessage: 'Bounded test report.',
+      role: 'test',
+    },
   ];
 
   for (const entry of cases) {
@@ -1376,7 +1396,7 @@ test('runWorkerOnce constrains Claude researcher tools without blocking test che
       parentTaskId: 'team-parent',
       payload: {
         adapter: 'claude',
-        executionMode: 'report',
+        executionMode: entry.executionMode,
         role: entry.role,
         title: `${entry.role} with bounded context`,
       },
@@ -1392,7 +1412,7 @@ test('runWorkerOnce constrains Claude researcher tools without blocking test che
           claude: async (adapterOptions) => {
             deliveredTools = adapterOptions.tools;
             return {
-              finalMessage: 'Bounded report.',
+              finalMessage: entry.finalMessage,
               ok: true,
               terminal: { status: 'success' },
             };

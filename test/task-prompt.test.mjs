@@ -111,6 +111,24 @@ test('buildTaskPrompt gives report roles a bounded investigation budget', () => 
   assert.doesNotMatch(testPrompt, /at most 12 repository-inspection tool calls/i);
 });
 
+test('buildTaskPrompt gives reviewers a diff-first inspection budget', () => {
+  const prompt = buildTaskPrompt({
+    payload: {
+      executionMode: 'review',
+      requiredChecks: ['git diff --check'],
+      role: 'reviewer',
+      title: 'Review the exact candidate',
+    },
+    taskId: 'review-budget-1',
+  }, { generation: 5 });
+
+  assert.match(prompt, /exact candidate diff first/i);
+  assert.match(prompt, /at most 16 repository-inspection tool calls/i);
+  assert.match(prompt, /at most 300 lines/i);
+  assert.match(prompt, /Do not spawn subagents/i);
+  assert.match(prompt, /Do not run checks broader than the controller-required list/i);
+});
+
 test('buildTaskPrompt keeps Git metadata controller-owned for standalone and build modes', () => {
   const standalone = buildTaskPrompt({
     payload: { title: 'Standalone change' },

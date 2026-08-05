@@ -57,6 +57,15 @@ function modeRequirements(executionMode, role) {
     ].join('\n');
   }
 
+  if (executionMode === 'review' && role === 'reviewer') {
+    return [
+      ...readOnlyRequirements,
+      '- Review the exact candidate diff first, then inspect only files needed to prove or dismiss a concrete finding.',
+      '- Do not spawn subagents for this bounded review; the controller already owns independent verification.',
+      '- Use at most 16 repository-inspection tool calls and at most 300 lines from any one file or command. Do not run checks broader than the controller-required list.',
+    ].join('\n');
+  }
+
   return readOnlyRequirements.join('\n');
 }
 

@@ -350,11 +350,16 @@ function resolveAdapterRunOptions(
     if (options[key] !== undefined) explicit[key] = options[key];
   }
 
-  const roleDefaults = adapterName === 'claude'
+  let roleDefaults = {};
+  if (adapterName === 'claude'
     && executionMode === 'report'
-    && role === 'researcher'
-    ? { tools: ['Read', 'Grep', 'Glob'] }
-    : {};
+    && role === 'researcher') {
+    roleDefaults = { tools: ['Read', 'Grep', 'Glob'] };
+  } else if (adapterName === 'claude'
+    && executionMode === 'review'
+    && role === 'reviewer') {
+    roleDefaults = { tools: ['Read', 'Grep', 'Glob', 'Bash'] };
+  }
 
   return {
     ...roleDefaults,
