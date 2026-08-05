@@ -14,6 +14,7 @@ Loopback GUI -> HTTP API --+-> Project context and policy
 Resident daemon -----------+    - Task DAG
   - Project Brain writes         - Project Brain assets
   - bounded worker slots         - Lease and fencing state
+  - fixed team fan-out/join      - Parent/child lineage
   - loadout resolution           - Role loadouts and bindings
   - continuous queue polling     - Bounded outbox
   - graceful shutdown            - Signed hash-chain event log
@@ -50,7 +51,7 @@ Project Brain events use the same chain. Asset and loadout events record non-bod
 
 ## Git model
 
-Each attempt uses a branch and worktree derived from task ID and generation, created from an exact base commit OID. The current branch can inspect and record a clean candidate commit but cannot merge, update the target ref, delete a branch, or delete a worktree.
+Each attempt uses a branch and worktree derived from task ID and generation, created from an exact base commit OID. Team Reviewer and Verifier attempts resolve their base from the completed Builder task's exact candidate OID. The current branch can inspect and record a clean candidate commit but cannot merge, update the target ref, delete a branch, or delete a worktree.
 
 ## Project Brain model
 
@@ -66,7 +67,17 @@ At task-claim time the controller resolves the active loadout for `task.payload.
 
 Project Brain is not a secret store. `direct` and `summary` entries copy asset text into the worker prompt, so that material may later appear in model-visible transcripts or final output. `reference` and `tool` entries inject only bounded locator metadata such as `source` objects, not the full body of the underlying knowledge source.
 
-This is intentionally narrower than autonomous memory or planning. The controller does not yet derive assets from run output, synthesize a Planner-owned task graph, or create parent/child Agent DAGs automatically.
+This remains narrower than autonomous memory or task invention. The controller does not derive assets from run output. It can execute a Planner-owned task graph only after the operator explicitly submits a team task; the graph shape and role set remain controller-fixed.
+
+## Team workflow model
+
+Team roots use the same task table and fencing tuple as standalone work. Schema v3 adds immutable `parent_task_id` and `slice_key` projections. Normal task creation is root-only: lineage can be written only inside the fenced `fanOutTask` transaction.
+
+The parent transitions from `running` to `waiting_children` after all five children and sibling dependencies are durably visible. It holds no worker slot while waiting. Child completion and failure re-evaluate direct parents inside the same transaction. Failed dependencies recursively terminalize queued descendants so a failed Builder cannot leave Reviewer and Verifier rows blocked forever.
+
+When the children settle, the parent returns to `queued`. Its second claim performs a deterministic database aggregate without launching a CLI or worktree. The controller validates the Builder candidate, Reviewer verdict, Verifier verdict, and required-check coverage before publishing one final review delivery.
+
+See [Automatic Agent team workflow](TEAM-WORKFLOW.md).
 
 ## Adapter model
 
@@ -84,7 +95,7 @@ Polling is deliberate in this version. SQLite remains authoritative, and reconne
 
 ## Resident scheduler
 
-`agent-team daemon` starts the GUI and one or more bounded worker loops in the same controller process. Each slot repeatedly calls `runWorkerOnce`, which atomically claims one ready task, prepares an exact-OID worktree, runs the selected adapter, snapshots the candidate, and publishes the review receipt. Manual GUI launches are disabled in daemon mode so they cannot bypass the configured concurrency budget.
+`agent-team daemon` starts the GUI and one or more bounded worker loops in the same controller process. Each slot repeatedly calls `runWorkerOnce`, which atomically claims one ready task and dispatches either a standalone attempt, one team stage, or a deterministic settled-parent aggregate. Manual GUI launches are disabled in daemon mode so they cannot bypass the configured concurrency budget.
 
 An idle or failed attempt backs off for the configured poll interval. A completed attempt can immediately look for the next ready task. A failure in one slot is recorded and does not terminate the other slots or the GUI.
 
@@ -96,8 +107,8 @@ Shutdown is graceful: the GUI stops admitting manual runs, its active runs and t
 - Remote brokers or databases
 - Automatic Git landing or pushing
 - Automatic worktree/branch deletion
-- Automatic Planner-owned task decomposition
-- Automatic parent/child Agent DAG synthesis
+- Autonomous task invention or an unbounded recursive Planner
+- Arbitrary model-selected roles or DAG shapes
 - Automatic memory extraction, summarization, or write-back from run output
 - Long-term semantic memory beyond the governed create-only Project Brain slice
 - Native desktop packaging, login-item installation, or OS service management

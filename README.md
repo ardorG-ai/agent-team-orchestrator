@@ -2,11 +2,11 @@
 
 Agent Team Orchestrator is a local-first control plane that lets Codex CLI and Claude Code CLI work like a small engineering team without introducing a multi-user SaaS stack.
 
-The current `0.2.0-dev.0` branch extends the original local kernel with the first Project Brain slice: versioned project assets, explicit role loadouts, bounded prompt injection, and read-only GUI/CLI projections over the same SQLite authority.
+The current `0.2.0-dev.1` branch combines the Project Brain foundation with the first executable Agent-team slice. A user-submitted team task now runs a bounded Planner, atomically creates a fixed parent/child DAG, fans out Builder/Researcher/Test work, and fans in through independent Reviewer and Verifier gates.
 
 The design combines the strongest ideas found during a source-level review of Spexcode, QM, Buzz, Compound Engineering Plugin, Open Code Review, TencentDB Agent Memory, ECC, and Matt Pocock's skills:
 
-- one SQLite authority for tasks, leases, attempts, outbox entries, and audit events;
+- one SQLite authority for tasks, lease generations, parent/child lineage, outbox entries, and audit events;
 - governed Project Brain assets and per-role loadout bindings;
 - atomic task claims with TTL leases and generation/token fencing;
 - bounded channels with explicit backpressure;
@@ -14,7 +14,7 @@ The design combines the strongest ideas found during a source-level review of Sp
 - exact-OID Git worktrees owned by the controller;
 - normalized Codex and Claude streaming adapters;
 - no automatic merge or destructive worktree cleanup;
-- no automatic Planner, no automatic parent/child Agent DAG synthesis, and no automatic memory extraction or write-back from model output.
+- a bounded, explicit team workflow without automatic merge, autonomous task invention, or automatic memory write-back from model output.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ npm test
 node bin/agent-team.mjs init
 node bin/agent-team.mjs doctor
 
-npm run daemon -- --repo . --concurrency 2
+npm run daemon -- --repo . --concurrency 4
 ```
 
 `agent-team daemon` is the recommended daily entry point. It starts both the loopback-only GUI and a resident scheduler, prints a local capability URL, and keeps polling SQLite for queued work. Leave that terminal running and open the exact printed URL in a browser.
@@ -48,6 +48,36 @@ node bin/agent-team.mjs task add \
 
 node bin/agent-team.mjs task list
 ```
+
+For a high-level request, submit one team task instead of manually creating every role:
+
+```bash
+node bin/agent-team.mjs team add \
+  --title "Implement the first vertical slice" \
+  --description "Plan, build, research, review, and verify the smallest complete slice" \
+  --adapter codex \
+  --base dev \
+  --idempotency-key first-team-slice
+```
+
+The Planner is read-only and may return only the strict `team.plan.v1` contract. The controller, not the model, creates the fixed DAG:
+
+```text
+Planner
+  ├─ Builder      (candidate commit)
+  ├─ Researcher   (read-only evidence report)
+  └─ Test         (read-only test analysis)
+         ↓ barrier
+      Reviewer    (exact Builder candidate)
+         ↓
+      Verifier    (exact Builder candidate + required checks)
+         ↓
+  deterministic parent aggregate
+```
+
+The parent task remains `waiting_children` without occupying a worker slot. When every child reaches a terminal state, SQLite wakes the parent for a deterministic aggregate and publishes one final review-channel delivery.
+
+If a team run fails, retry the failed parent from the GUI or with `agent-team task retry`. The retry keeps the validated plan and child lineage, requeues only failed lanes and their failed dependents, reuses completed work, and returns to the aggregate after recovery; it does not run Planner or fan out duplicate slices again.
 
 Project Brain content is controller-written and role-scoped. You can create versioned assets, assemble them into loadouts, and bind a loadout to a role before queuing work:
 
@@ -102,7 +132,7 @@ node bin/agent-team.mjs worker run --worker builder-1 --adapter codex
 node bin/agent-team.mjs events verify
 ```
 
-The resident daemon provides execution continuity; it does not yet invent improvement work, synthesize a Planner-owned task tree, spawn an automatic parent/child Agent DAG on its own, extract memory from runs, write new Project Brain assets automatically, or promote changes by itself. The planned self-improvement loop will enqueue bounded critique/build/review/verification tasks against `dev`, then require an independently verified promotion transaction.
+The resident daemon provides execution continuity and can execute an explicitly submitted Planner-owned task tree. It still does not invent speculative improvement work, recursively accept arbitrary Agent-created roles or DAGs, extract memory from runs, write Project Brain assets automatically, merge candidates, or promote changes by itself. A future self-improvement policy may enqueue bounded team tasks against `dev`, but promotion still requires an independently verified exact-OID transaction.
 
 The project database, event key, worktrees, and run artifacts live outside the repository under:
 
@@ -122,11 +152,13 @@ The orchestrator assumes one trusted local operator, but it does not trust child
 - Automatic worktree deletion and branch deletion are deliberately absent.
 - Automatic landing into `main` is deliberately absent until reviewed-OID CAS landing is implemented and verified.
 - Workers do not write Project Brain assets or bindings directly from model output. Project Brain writes go through controller APIs only.
+- Planner, Reviewer, and Verifier outputs are strict, size-bounded JSON contracts. Unknown fields, missing required checks, read-only worktree mutations, and malformed verdicts fail closed.
+- Parent/child lineage can only be created by a fenced atomic fan-out transaction. A normal task-creation call cannot attach children to queued or terminal parents.
 
 The current branch trusts the local operator's installed `git`, `codex`, and `claude` executables. `agent-team doctor` reports the absolute executable paths it resolved. Do not launch the orchestrator from an environment whose `PATH` is controlled by an untrusted repository.
 
-See [Project Brain](docs/PROJECT-BRAIN.md), [GUI and daemon](docs/GUI.md), [Architecture](docs/ARCHITECTURE.md), [Security](docs/SECURITY.md), and [Roadmap](docs/ROADMAP.md).
+See [Team workflow](docs/TEAM-WORKFLOW.md), [Project Brain](docs/PROJECT-BRAIN.md), [GUI and daemon](docs/GUI.md), [Architecture](docs/ARCHITECTURE.md), [Security](docs/SECURITY.md), and [Roadmap](docs/ROADMAP.md).
 
 ## Development lifecycle
 
-`main` holds the last verified stable baseline. `dev` is the current self-iteration branch, including the `0.2.0-dev.0` Project Brain work. Ongoing self-improvement still returns through independent review and verification before promotion to `main`.
+`main` holds the last verified stable baseline. `dev` is the current self-iteration branch, including the `0.2.0-dev.1` Project Brain and automatic team-workflow slice. Ongoing self-improvement still returns through independent review and verification before promotion to `main`.

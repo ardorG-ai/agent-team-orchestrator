@@ -36,6 +36,18 @@ Project Brain is a controller-governed store, not a model-writable scratchpad.
 
 This is the key constraint that keeps prompt injection, hallucinated memory, and runaway self-editing from turning into durable control-plane state.
 
+## Team orchestration boundary
+
+- Only a fenced controller transaction may create parent/child lineage. Ordinary `createTask` calls are root-only.
+- Planner output selects bounded objectives and scopes inside a controller-fixed five-child graph; it cannot add roles or arbitrary dependencies.
+- A non-empty operator scope is an upper bound. Empty Researcher/Test scopes inherit it instead of expanding to the repository.
+- Planner, Researcher, Test, Reviewer, and Verifier worktrees are read-only at the Git snapshot boundary.
+- Reviewer and Verifier resolve the exact completed Builder candidate OID through the store and must belong to the same parent.
+- Handoffs expose only allowlisted result fields, are capped at 12 KiB, and are labeled untrusted in the receiving prompt.
+- Reviewer/Verifier JSON rejects unknown fields. A verification `PASS` must contain every required check as a unique passing receipt.
+- Failed dependencies terminalize queued descendants; a failed lane cannot silently leave the parent waiting forever.
+- The final team verdict is derived by controller code. Agent text cannot directly mark the parent ready or update a Git ref.
+
 ## Auth reuse
 
 Codex and Claude adapters may reuse the operator's existing CLI authentication through an explicit, narrow environment/config allowlist. The orchestrator never copies credentials into its database, event log, task prompt, or artifacts.

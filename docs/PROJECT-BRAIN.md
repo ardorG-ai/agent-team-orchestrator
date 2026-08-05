@@ -2,7 +2,7 @@
 
 ## Scope of the current branch
 
-Project Brain in `0.2.0-dev.0` is a governed project-reference store inside the controller's SQLite database.
+Project Brain in `0.2.0-dev.1` is a governed project-reference store inside the controller's SQLite database.
 
 What is implemented now:
 
@@ -18,8 +18,8 @@ What is implemented now:
 
 What is not implemented:
 
-- No automatic Planner that decomposes work into new tasks
-- No automatic parent/child sub-Agent DAG synthesis
+- No autonomous Planner that invents work without an explicit team task
+- No arbitrary or recursive model-selected sub-Agent DAG; the executable team graph is controller-fixed
 - No automatic extraction of memory from run output
 - No automatic summarization or promotion of model output into Project Brain
 - No automatic write-back loop from review/verification results into assets or loadouts

@@ -1,4 +1,4 @@
-export const HELP = `Agent Team Orchestrator v0.2.0-dev.0
+export const HELP = `Agent Team Orchestrator v0.2.0-dev.1
 
 Usage:
   agent-team init [--repo PATH] [--state-root PATH] [--json]
@@ -11,6 +11,12 @@ Usage:
                       [--depends ID[,ID...]] [--scope PATH[,PATH...]]
                       [--base REF] [--channel CHANNEL] [--role ROLE]
                       --idempotency-key KEY
+  agent-team team add --title TEXT [--description TEXT] [--adapter codex|claude]
+                      [--depends ID[,ID...]] [--scope PATH[,PATH...]]
+                      [--base REF] [--channel CHANNEL]
+                      [--builder-adapter codex|claude] [--researcher-adapter codex|claude]
+                      [--test-adapter codex|claude] [--reviewer-adapter codex|claude]
+                      [--verifier-adapter codex|claude] --idempotency-key KEY
   agent-team task list [--status STATUS] [--json]
   agent-team task show TASK_ID [--json]
   agent-team task claim --worker WORKER [--task TASK_ID] [--lease-ms N] [--json]
@@ -67,4 +73,8 @@ Project Brain:
   Asset kinds are memory, skill, and knowledge. --layer only applies to memory assets.
   Loadout asset modes are direct, summary, reference, and tool. Omitted mode defaults to direct.
   Omitted loadout priority preserves listed order by assigning higher priority to earlier entries.
+
+Agent teams:
+  team add creates a Planner root task. The Planner atomically expands it into bounded Builder,
+  Researcher, Test, Reviewer, and Verifier child tasks; adapter overrides control each role.
 `;

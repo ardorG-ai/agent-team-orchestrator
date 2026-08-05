@@ -789,3 +789,171 @@ test('POST /api/tasks creates tasks and POST /api/tasks/:id/retry retries failed
     harness.cleanup([webRoot]);
   }
 });
+
+test('POST /api/tasks/:id/retry restores failed team roots without leaking claim tokens', async () => {
+  const harness = createStoreHarness('gui-team-retry');
+  const store = harness.open();
+  const webRoot = await harness.makeWebRoot();
+  const server = await startGuiServer({
+    context: harness.context,
+    mutationToken: 'team-retry-token',
+    store,
+    webRoot,
+  });
+
+  try {
+    const parent = store.createTask({
+      key: 'gui-team-retry-root',
+      payload: {
+        adapter: 'codex',
+        executionMode: 'planner',
+        role: 'planner',
+        scope: ['src/', 'test/'],
+        title: 'Recover a failed GUI team root',
+      },
+    }).task;
+    const planner = store.claimTask({ worker: 'planner', taskId: parent.taskId });
+    const plannerResult = {
+      plan: {
+        schema: 'team.plan.v1',
+        summary: 'Reuse the existing child DAG during team retry.',
+        assumptions: [],
+        acceptanceCriteria: [{ id: 'ac-1', text: 'Retry preserves completed slices and child IDs.' }],
+        lanes: {
+          builder: { objective: 'Repair implementation.', scope: ['src/'] },
+          researcher: { objective: 'Summarize constraints.', scope: [] },
+          test: { objective: 'Define coverage.', scope: ['test/'] },
+        },
+        requiredChecks: ['npm test'],
+      },
+      team: { planner: 'codex' },
+    };
+    const { children } = store.fanOutTask({
+      taskId: planner.taskId,
+      worker: planner.worker,
+      generation: planner.generation,
+      claimToken: planner.claimToken,
+      result: plannerResult,
+      children: [
+        { sliceKey: 'builder', key: 'gui-team-builder', payload: { role: 'builder' } },
+        { sliceKey: 'researcher', key: 'gui-team-researcher', payload: { role: 'researcher' } },
+        { sliceKey: 'test', key: 'gui-team-test', payload: { role: 'test' } },
+        {
+          sliceKey: 'reviewer',
+          key: 'gui-team-reviewer',
+          payload: { role: 'reviewer' },
+          dependencySliceKeys: ['builder', 'researcher', 'test'],
+        },
+        {
+          sliceKey: 'verifier',
+          key: 'gui-team-verifier',
+          payload: { role: 'verifier' },
+          dependencySliceKeys: ['reviewer'],
+        },
+      ],
+    });
+    const childBySlice = Object.fromEntries(children.map((child) => [child.sliceKey, child]));
+
+    const builderClaim = store.claimTask({
+      worker: 'builder',
+      taskId: childBySlice.builder.taskId,
+    });
+    store.failTask({
+      taskId: builderClaim.taskId,
+      worker: builderClaim.worker,
+      generation: builderClaim.generation,
+      claimToken: builderClaim.claimToken,
+      error: new Error('builder failed'),
+    });
+
+    const researcherClaim = store.claimTask({
+      worker: 'researcher',
+      taskId: childBySlice.researcher.taskId,
+    });
+    store.completeTask({
+      taskId: researcherClaim.taskId,
+      worker: researcherClaim.worker,
+      generation: researcherClaim.generation,
+      claimToken: researcherClaim.claimToken,
+      result: { finalMessage: 'research complete' },
+    });
+
+    const testClaim = store.claimTask({
+      worker: 'tester',
+      taskId: childBySlice.test.taskId,
+    });
+    store.completeTask({
+      taskId: testClaim.taskId,
+      worker: testClaim.worker,
+      generation: testClaim.generation,
+      claimToken: testClaim.claimToken,
+      result: { finalMessage: 'tests complete' },
+    });
+
+    const aggregateClaim = store.claimTask({
+      worker: 'aggregate',
+      taskId: parent.taskId,
+    });
+    const failedParent = store.failTask({
+      taskId: aggregateClaim.taskId,
+      worker: aggregateClaim.worker,
+      generation: aggregateClaim.generation,
+      claimToken: aggregateClaim.claimToken,
+      error: new Error('team child failure: builder'),
+      preserveResult: true,
+    });
+
+    const retryResponse = await fetchJson(`${server.url}/api/tasks/${parent.taskId}/retry`, {
+      body: JSON.stringify({
+        expectedGeneration: failedParent.generation,
+        reason: 'retry failed team root',
+      }),
+      headers: {
+        'content-type': 'application/json',
+        [GUI_MUTATION_TOKEN_HEADER]: 'team-retry-token',
+        origin: server.url,
+      },
+      method: 'POST',
+    });
+
+    assert.equal(retryResponse.response.status, 200);
+    assert.equal(retryResponse.body.task.taskId, parent.taskId);
+    assert.equal(retryResponse.body.task.state, 'waiting_children');
+    assert.equal(retryResponse.body.task.generation, failedParent.generation + 1);
+    assert.deepEqual(retryResponse.body.task.result.plan, plannerResult.plan);
+    assert.equal(JSON.stringify(retryResponse.body).includes('claimToken'), false);
+    assert.equal('claimToken' in retryResponse.body.task, false);
+
+    const retriedParent = store.getTask(parent.taskId);
+    const retriedBuilder = store.getTask(childBySlice.builder.taskId);
+    const retriedReviewer = store.getTask(childBySlice.reviewer.taskId);
+    const retriedVerifier = store.getTask(childBySlice.verifier.taskId);
+    const completedResearcher = store.getTask(childBySlice.researcher.taskId);
+    const completedTester = store.getTask(childBySlice.test.taskId);
+
+    assert.equal(retriedParent.state, 'waiting_children');
+    assert.deepEqual(
+      [retriedBuilder.taskId, retriedReviewer.taskId, retriedVerifier.taskId],
+      [childBySlice.builder.taskId, childBySlice.reviewer.taskId, childBySlice.verifier.taskId],
+    );
+    assert.equal(retriedBuilder.state, 'queued');
+    assert.equal(retriedBuilder.generation, 2);
+    assert.equal(retriedBuilder.result, null);
+    assert.equal(retriedBuilder.error, null);
+
+    for (const task of [retriedReviewer, retriedVerifier]) {
+      assert.equal(task.state, 'queued');
+      assert.equal(task.error, null);
+      assert.equal(task.taskId, childBySlice[task.sliceKey].taskId);
+    }
+
+    assert.equal(completedResearcher.state, 'completed');
+    assert.equal(completedResearcher.generation, 1);
+    assert.equal(completedTester.state, 'completed');
+    assert.equal(completedTester.generation, 1);
+  } finally {
+    await server.close();
+    store.close();
+    harness.cleanup([webRoot]);
+  }
+});

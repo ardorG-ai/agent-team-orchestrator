@@ -39,6 +39,14 @@ const PROJECT_ASSET_KINDS = new Set(['memory', 'skill', 'knowledge']);
 const PROJECT_MEMORY_LAYERS = new Set(['l1', 'l2', 'l3']);
 const ROLE_LOADOUT_MODES = new Set(['direct', 'summary', 'reference', 'tool']);
 const PROJECT_BRAIN_LIST_LIMIT_MAX = 1_000;
+const ADAPTERS = new Set(['codex', 'claude']);
+const DEFAULT_TEAM_ADAPTERS = Object.freeze({
+  builder: 'codex',
+  researcher: 'claude',
+  reviewer: 'claude',
+  test: 'codex',
+  verifier: 'codex',
+});
 
 function scalarFlag(parsed, name, fallback = undefined) {
   const value = flag(parsed, name, fallback);
@@ -121,10 +129,14 @@ function jsonFlag(parsed, name, fallback = undefined) {
 
 function adapterFlag(parsed, fallback = 'codex') {
   const adapter = optionalStringFlag(parsed, 'adapter', fallback);
-  if (!['codex', 'claude'].includes(adapter)) {
+  if (!ADAPTERS.has(adapter)) {
     throw new AgentTeamError('invalid_argument', '--adapter must be codex or claude');
   }
   return adapter;
+}
+
+function namedAdapterFlag(parsed, name, fallback) {
+  return enumFlag(parsed, name, ADAPTERS, fallback);
 }
 
 function publicContext(context) {
@@ -269,6 +281,37 @@ function taskPayload(parsed, baseOid) {
   };
 }
 
+function teamTaskPayload(parsed, baseOid) {
+  for (const deferredFlag of ['priority', 'max-attempts']) {
+    if (scalarFlag(parsed, deferredFlag) !== undefined) {
+      throw new AgentTeamError(
+        'unsupported_argument',
+        `--${deferredFlag} is not enforced in the current release and is intentionally unavailable`,
+      );
+    }
+  }
+
+  const dependencies = listFlag(parsed, 'depends');
+  return {
+    adapter: adapterFlag(parsed),
+    baseOid,
+    channel: optionalStringFlag(parsed, 'channel', 'review'),
+    dependencies,
+    description: optionalStringFlag(parsed, 'description', ''),
+    executionMode: 'planner',
+    role: 'planner',
+    scope: listFlag(parsed, 'scope'),
+    teamAdapters: {
+      builder: namedAdapterFlag(parsed, 'builder-adapter', DEFAULT_TEAM_ADAPTERS.builder),
+      researcher: namedAdapterFlag(parsed, 'researcher-adapter', DEFAULT_TEAM_ADAPTERS.researcher),
+      test: namedAdapterFlag(parsed, 'test-adapter', DEFAULT_TEAM_ADAPTERS.test),
+      reviewer: namedAdapterFlag(parsed, 'reviewer-adapter', DEFAULT_TEAM_ADAPTERS.reviewer),
+      verifier: namedAdapterFlag(parsed, 'verifier-adapter', DEFAULT_TEAM_ADAPTERS.verifier),
+    },
+    title: requiredStringFlag(parsed, 'title'),
+  };
+}
+
 function projectAssetContent(parsed, cwd) {
   const inlineContent = scalarFlag(parsed, 'content');
   const contentFile = scalarFlag(parsed, 'content-file');
@@ -365,7 +408,7 @@ export async function executeCli(argv, options = {}) {
     return HELP;
   }
   if (booleanFlag(parsed, 'version') || parsed.positionals[0] === 'version') {
-    return '0.2.0-dev.0';
+    return '0.2.0-dev.1';
   }
 
   const command = commandKey(parsed);
@@ -527,6 +570,19 @@ export async function executeCli(argv, options = {}) {
       const requestedBase = optionalStringFlag(parsed, 'base', 'HEAD');
       const baseOid = await dependencies.resolveCommitOidFn(context.repoRoot, requestedBase);
       const payload = taskPayload(parsed, baseOid);
+      return store.createTask({
+        key: requiredStringFlag(parsed, 'idempotency-key'),
+        payload,
+        dependencies: payload.dependencies,
+      });
+    });
+  }
+
+  if (command === 'team add') {
+    return withProjectStore(parsed, dependencies, async ({ context, store }) => {
+      const requestedBase = optionalStringFlag(parsed, 'base', 'HEAD');
+      const baseOid = await dependencies.resolveCommitOidFn(context.repoRoot, requestedBase);
+      const payload = teamTaskPayload(parsed, baseOid);
       return store.createTask({
         key: requiredStringFlag(parsed, 'idempotency-key'),
         payload,

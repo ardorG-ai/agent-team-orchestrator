@@ -112,6 +112,18 @@
             <span class="working-action">查看动态</span>
           </button>
 
+          <section class="team-map-panel" id="team-map-panel" aria-labelledby="team-map-heading" hidden>
+            <div class="team-map-heading">
+              <div>
+                <span class="section-kicker">Agent lineage</span>
+                <h2 id="team-map-heading">Agent 团队树</h2>
+                <p>Planner 拆分后的父子任务、角色路由和依赖关系会在这里形成可点击的执行图。</p>
+              </div>
+              <span class="team-map-count" id="team-map-count">0 teams</span>
+            </div>
+            <div class="team-forest" id="team-forest"></div>
+          </section>
+
           <div class="workbench-grid">
             <section class="board-panel" aria-labelledby="tasks-heading">
               <div class="section-heading">
@@ -275,15 +287,35 @@
             <textarea name="description" rows="5" maxlength="8000" placeholder="说明目标、验收条件和禁止事项"></textarea>
           </label>
 
+          <fieldset class="execution-mode-field field-span">
+            <legend>执行方式</legend>
+            <div class="execution-mode-options">
+              <label>
+                <input type="radio" name="executionMode" value="single" checked>
+                <span>
+                  <strong>单 Agent</strong>
+                  <small>直接交给一个 CLI 角色执行</small>
+                </span>
+              </label>
+              <label>
+                <input type="radio" name="executionMode" value="team">
+                <span>
+                  <strong>Agent 团队</strong>
+                  <small>Planner 自动拆分、审查并复验</small>
+                </span>
+              </label>
+            </div>
+          </fieldset>
+
           <label class="field">
-            <span>Agent</span>
+            <span id="task-adapter-label">Agent</span>
             <select name="adapter">
               <option value="codex">Codex CLI</option>
               <option value="claude">Claude Code CLI</option>
             </select>
           </label>
 
-          <label class="field">
+          <label class="field" id="task-role-field">
             <span>角色</span>
             <select name="role">
               <option value="builder">Builder</option>
@@ -292,6 +324,48 @@
               <option value="architect">Architect</option>
             </select>
           </label>
+
+          <fieldset class="team-routing field-span" id="team-routing" hidden>
+            <legend>团队角色路由</legend>
+            <p>Planner 只负责生成受限任务图；Builder、Researcher、Test 并行，Reviewer 与 Verifier 独立把关。</p>
+            <div class="team-routing-grid">
+              <label class="field">
+                <span>Builder</span>
+                <select name="builderAdapter">
+                  <option value="codex">Codex CLI</option>
+                  <option value="claude">Claude Code CLI</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Researcher</span>
+                <select name="researcherAdapter">
+                  <option value="claude">Claude Code CLI</option>
+                  <option value="codex">Codex CLI</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Test</span>
+                <select name="testAdapter">
+                  <option value="codex">Codex CLI</option>
+                  <option value="claude">Claude Code CLI</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Reviewer</span>
+                <select name="reviewerAdapter">
+                  <option value="claude">Claude Code CLI</option>
+                  <option value="codex">Codex CLI</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Verifier</span>
+                <select name="verifierAdapter">
+                  <option value="codex">Codex CLI</option>
+                  <option value="claude">Claude Code CLI</option>
+                </select>
+              </label>
+            </div>
+          </fieldset>
 
           <label class="field">
             <span>基础分支或 OID</span>

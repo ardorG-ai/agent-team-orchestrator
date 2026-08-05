@@ -10,9 +10,15 @@ import {
 const TASK_STATES = {
   queued: 'queued',
   running: 'running',
+  waitingChildren: 'waiting_children',
   completed: 'completed',
   failed: 'failed',
 };
+
+const TERMINAL_TASK_STATES = new Set([
+  TASK_STATES.completed,
+  TASK_STATES.failed,
+]);
 
 const OUTBOX_STATES = {
   pending: 'pending',
@@ -159,6 +165,24 @@ const MIGRATIONS = [
         ON role_loadout_bindings(loadout_id);
     `,
   },
+  {
+    version: 3,
+    sql: `
+      ALTER TABLE tasks
+        ADD COLUMN parent_task_id TEXT REFERENCES tasks(task_id) ON DELETE RESTRICT;
+
+      ALTER TABLE tasks
+        ADD COLUMN slice_key TEXT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_parent_slice_unique
+        ON tasks(parent_task_id, slice_key)
+        WHERE parent_task_id IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_parent_created
+        ON tasks(parent_task_id, created_at, task_id)
+        WHERE parent_task_id IS NOT NULL;
+    `,
+  },
 ];
 
 export class TaskConflictError extends Error {
@@ -229,6 +253,10 @@ function requireNullableEnum(name, value, allowedValues) {
   }
   requireEnum(name, value, allowedValues);
   return value;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 function assertMaxUtf8Bytes(name, value, maxBytes) {
@@ -401,6 +429,8 @@ function rowToTask(row) {
   return {
     taskId: row.task_id,
     key: row.task_key,
+    parentTaskId: row.parent_task_id ?? null,
+    sliceKey: row.slice_key ?? null,
     payload: parseJsonColumn(row.payload_json),
     payloadHash: row.payload_hash,
     state: row.state,
@@ -706,6 +736,269 @@ export function openProjectStore(options) {
     const task = rowToTask(row);
     if (task) task.dependencies = getTaskDependencyIds(task.taskId);
     return task;
+  }
+
+  function listTaskChildRows(parentTaskId) {
+    return prepare(
+      `SELECT *
+       FROM tasks
+       WHERE parent_task_id = ?
+       ORDER BY created_at, task_id`,
+    ).all(parentTaskId);
+  }
+
+  function normalizeFanOutChildren(children, parentTaskId) {
+    if (!Array.isArray(children)) {
+      throw new TypeError('children must be an array');
+    }
+    if (children.length < 1 || children.length > 16) {
+      throw new TypeError('children must contain between 1 and 16 tasks');
+    }
+
+    const seenSliceKeys = new Set();
+    const seenKeys = new Set();
+    const seenTaskIds = new Set();
+    const normalized = children.map((child, index) => {
+      if (!isPlainObject(child)) {
+        throw new TypeError(`children[${index}] must be a plain object`);
+      }
+
+      requireString(`children[${index}].sliceKey`, child.sliceKey);
+      requireString(`children[${index}].key`, child.key);
+      if (seenSliceKeys.has(child.sliceKey)) {
+        throw new TypeError(`Duplicate child sliceKey: ${child.sliceKey}`);
+      }
+      if (seenKeys.has(child.key)) {
+        throw new TypeError(`Duplicate child key: ${child.key}`);
+      }
+      seenSliceKeys.add(child.sliceKey);
+      seenKeys.add(child.key);
+
+      const taskId = child.taskId ?? generateId();
+      requireString(`children[${index}].taskId`, taskId);
+      if (taskId === parentTaskId) {
+        throw new TypeError(`Child task "${taskId}" cannot be its own parent`);
+      }
+      if (seenTaskIds.has(taskId)) {
+        throw new TypeError(`Duplicate child taskId: ${taskId}`);
+      }
+      seenTaskIds.add(taskId);
+
+      const dependencySliceKeys = child.dependencySliceKeys ?? [];
+      if (!Array.isArray(dependencySliceKeys)) {
+        throw new TypeError(
+          `children[${index}].dependencySliceKeys must be an array`,
+        );
+      }
+      for (const dependencySliceKey of dependencySliceKeys) {
+        requireString(
+          `children[${index}].dependencySliceKey`,
+          dependencySliceKey,
+        );
+      }
+
+      return {
+        taskId,
+        key: child.key,
+        sliceKey: child.sliceKey,
+        payload: child.payload,
+        payloadJson: canonicalStringify(child.payload),
+        payloadHash: canonicalHash(child.payload),
+        dependencySliceKeys: [...new Set(dependencySliceKeys)].sort(),
+      };
+    });
+
+    const childBySliceKey = new Map(
+      normalized.map((child) => [child.sliceKey, child]),
+    );
+    for (const child of normalized) {
+      for (const dependencySliceKey of child.dependencySliceKeys) {
+        if (dependencySliceKey === child.sliceKey) {
+          throw new TypeError(
+            `Child slice "${child.sliceKey}" cannot depend on itself`,
+          );
+        }
+        if (!childBySliceKey.has(dependencySliceKey)) {
+          throw new TypeError(
+            `Child slice "${child.sliceKey}" references unknown sibling "${dependencySliceKey}"`,
+          );
+        }
+      }
+    }
+
+    const visitState = new Map();
+    function visit(sliceKey) {
+      const state = visitState.get(sliceKey);
+      if (state === 'visiting') {
+        throw new TypeError('Child dependency graph contains a cycle');
+      }
+      if (state === 'visited') {
+        return;
+      }
+
+      visitState.set(sliceKey, 'visiting');
+      for (const dependencySliceKey of childBySliceKey.get(sliceKey).dependencySliceKeys) {
+        visit(dependencySliceKey);
+      }
+      visitState.set(sliceKey, 'visited');
+    }
+    for (const child of normalized) {
+      visit(child.sliceKey);
+    }
+
+    return {
+      normalized,
+      childBySliceKey,
+    };
+  }
+
+  function mergeFanOutResult(result, childTaskIds) {
+    const normalizedResult = canonicalParse(canonicalStringify(result));
+    const baseResult = isPlainObject(normalizedResult)
+      ? normalizedResult
+      : { plannerResult: normalizedResult };
+    const existingTeam = isPlainObject(baseResult.team)
+      ? baseResult.team
+      : baseResult.team === undefined
+        ? {}
+        : { plannerResult: baseResult.team };
+
+    return {
+      ...baseResult,
+      team: {
+        ...existingTeam,
+        phase: 'waiting-children',
+        childTaskIds,
+      },
+    };
+  }
+
+  function failQueuedDependencyDescendants(rootTaskId, failedAt) {
+    const terminalTaskIds = [rootTaskId];
+    const queue = [rootTaskId];
+    const seen = new Set(queue);
+
+    while (queue.length > 0) {
+      const dependencyTaskId = queue.shift();
+      const dependentRows = prepare(
+        `SELECT t.*
+         FROM task_dependencies d
+         JOIN tasks t ON t.task_id = d.task_id
+         WHERE d.depends_on_task_id = ?
+           AND t.state = ?
+         ORDER BY t.created_at, t.task_id`,
+      ).all(dependencyTaskId, TASK_STATES.queued);
+
+      for (const dependentRow of dependentRows) {
+        const dependencyError = {
+          code: 'dependency_failed',
+          dependencyTaskId,
+          message: `Dependency task "${dependencyTaskId}" failed`,
+        };
+        const update = prepare(
+          `UPDATE tasks
+           SET state = ?,
+               lease_owner = NULL,
+               claim_token = NULL,
+               claim_expires_at = NULL,
+               error_json = ?,
+               result_json = NULL,
+               updated_at = ?,
+               failed_at = ?,
+               completed_at = NULL
+           WHERE task_id = ?
+             AND state = ?`,
+        ).run(
+          TASK_STATES.failed,
+          canonicalStringify(dependencyError),
+          failedAt,
+          failedAt,
+          dependentRow.task_id,
+          TASK_STATES.queued,
+        );
+        if (update.changes !== 1) {
+          continue;
+        }
+
+        terminalTaskIds.push(dependentRow.task_id);
+        appendEvent('task.failed', 'task', dependentRow.task_id, {
+          taskId: dependentRow.task_id,
+          generation: dependentRow.generation,
+          reason: dependencyError.code,
+          dependencyTaskId,
+        });
+
+        if (!seen.has(dependentRow.task_id)) {
+          seen.add(dependentRow.task_id);
+          queue.push(dependentRow.task_id);
+        }
+      }
+    }
+
+    return terminalTaskIds;
+  }
+
+  function wakeSettledParents(terminalTaskIds, settledAt) {
+    const parentTaskIds = new Set();
+    for (const terminalTaskId of terminalTaskIds) {
+      const row = getTaskRowById(terminalTaskId);
+      if (row?.parent_task_id) {
+        parentTaskIds.add(row.parent_task_id);
+      }
+    }
+
+    for (const parentTaskId of parentTaskIds) {
+      const parentRow = getTaskRowById(parentTaskId);
+      if (!parentRow || parentRow.state !== TASK_STATES.waitingChildren) {
+        continue;
+      }
+
+      const childRows = listTaskChildRows(parentTaskId);
+      if (
+        childRows.length === 0 ||
+        childRows.some((childRow) => !TERMINAL_TASK_STATES.has(childRow.state))
+      ) {
+        continue;
+      }
+
+      const update = prepare(
+        `UPDATE tasks
+         SET state = ?,
+             lease_owner = NULL,
+             claim_token = NULL,
+             claim_expires_at = NULL,
+             available_at = ?,
+             updated_at = ?,
+             completed_at = NULL,
+             failed_at = NULL
+         WHERE task_id = ?
+           AND state = ?`,
+      ).run(
+        TASK_STATES.queued,
+        settledAt,
+        settledAt,
+        parentTaskId,
+        TASK_STATES.waitingChildren,
+      );
+      if (update.changes !== 1) {
+        throw new TaskConflictError('settled parent wake-up fence changed during transaction', {
+          parentTaskId,
+          state: parentRow.state,
+          childTaskIds: childRows.map((childRow) => childRow.task_id),
+        });
+      }
+
+      appendEvent('task.children-settled', 'task', parentTaskId, {
+        taskId: parentTaskId,
+        childTaskIds: childRows.map((childRow) => childRow.task_id),
+        completedTaskIds: childRows
+          .filter((childRow) => childRow.state === TASK_STATES.completed)
+          .map((childRow) => childRow.task_id),
+        failedTaskIds: childRows
+          .filter((childRow) => childRow.state === TASK_STATES.failed)
+          .map((childRow) => childRow.task_id),
+      });
+    }
   }
 
   function getOutboxRowById(messageId) {
@@ -1496,6 +1789,11 @@ export function openProjectStore(options) {
       return hydrateTask(getTaskRowByKey(taskKey));
     },
 
+    listTaskChildren(parentTaskId) {
+      requireString('parentTaskId', parentTaskId);
+      return listTaskChildRows(parentTaskId).map(hydrateTask);
+    },
+
     listTasks(filters = {}) {
       const clauses = [];
       const params = [];
@@ -1530,13 +1828,23 @@ export function openProjectStore(options) {
         .map(hydrateTask);
     },
 
-    createTask({
-      key,
-      payload,
-      dependencies = [],
-      availableAt = now(),
-      taskId = generateId(),
-    }) {
+    createTask(input) {
+      if (!isPlainObject(input)) {
+        throw new TypeError('createTask input must be a plain object');
+      }
+      if (Object.hasOwn(input, 'parentTaskId') || Object.hasOwn(input, 'sliceKey')) {
+        throw new TypeError(
+          'Child tasks must be created atomically through fanOutTask',
+        );
+      }
+
+      const {
+        key,
+        payload,
+        dependencies = [],
+        availableAt = now(),
+        taskId = generateId(),
+      } = input;
       requireString('key', key);
       requireString('taskId', taskId);
 
@@ -1637,6 +1945,225 @@ export function openProjectStore(options) {
         return {
           status: 'created',
           task: hydrateTask(getTaskRowById(taskId)),
+        };
+      });
+    },
+
+    fanOutTask({
+      taskId,
+      worker,
+      generation,
+      claimToken,
+      result = null,
+      children,
+    }) {
+      requireString('taskId', taskId);
+      requireString('worker', worker);
+      requireString('claimToken', claimToken);
+      requirePositiveInteger('generation', generation);
+
+      return withTransaction('IMMEDIATE', () => {
+        const fanOutAt = now();
+        const current = prepare(
+          `SELECT *
+           FROM tasks
+           WHERE task_id = ?
+             AND lease_owner = ?
+             AND generation = ?
+             AND claim_token = ?
+             AND state = ?
+             AND claim_expires_at >= ?`,
+        ).get(
+          taskId,
+          worker,
+          generation,
+          claimToken,
+          TASK_STATES.running,
+          fanOutAt,
+        );
+        if (!current) {
+          return null;
+        }
+
+        const existingChildren = listTaskChildRows(taskId);
+        if (existingChildren.length > 0) {
+          throw new TaskConflictError(
+            `Task "${taskId}" already has direct children and cannot fan out again`,
+            {
+              taskId,
+              childTaskIds: existingChildren.map((childRow) => childRow.task_id),
+              childSliceKeys: existingChildren.map((childRow) => childRow.slice_key),
+            },
+          );
+        }
+
+        const { normalized, childBySliceKey } = normalizeFanOutChildren(
+          children,
+          taskId,
+        );
+        for (const child of normalized) {
+          const existingByKey = getTaskRowByKey(child.key);
+          if (existingByKey) {
+            throw new TaskConflictError(
+              `Task key "${child.key}" already exists`,
+              {
+                key: child.key,
+                existingTaskId: existingByKey.task_id,
+                requestedTaskId: child.taskId,
+              },
+            );
+          }
+
+          const existingById = getTaskRowById(child.taskId);
+          if (existingById) {
+            throw new TaskConflictError(
+              `Task id "${child.taskId}" already exists`,
+              {
+                taskId: child.taskId,
+                existingKey: existingById.task_key,
+                requestedKey: child.key,
+              },
+            );
+          }
+
+          const existingSlice = prepare(
+            `SELECT task_id
+             FROM tasks
+             WHERE parent_task_id = ?
+               AND slice_key = ?`,
+          ).get(taskId, child.sliceKey);
+          if (existingSlice) {
+            throw new TaskConflictError(
+              `Parent task "${taskId}" already has slice "${child.sliceKey}"`,
+              {
+                parentTaskId: taskId,
+                sliceKey: child.sliceKey,
+                existingTaskId: existingSlice.task_id,
+              },
+            );
+          }
+        }
+
+        const childTaskIds = normalized.map((child) => child.taskId);
+        const mergedResult = mergeFanOutResult(result, childTaskIds);
+        const mergedResultJson = canonicalStringify(mergedResult);
+
+        for (const child of normalized) {
+          prepare(
+            `INSERT INTO tasks(
+              task_id,
+              task_key,
+              payload_json,
+              payload_hash,
+              state,
+              generation,
+              lease_owner,
+              claim_token,
+              claim_expires_at,
+              available_at,
+              created_at,
+              updated_at,
+              completed_at,
+              failed_at,
+              result_json,
+              error_json,
+              parent_task_id,
+              slice_key
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            child.taskId,
+            child.key,
+            child.payloadJson,
+            child.payloadHash,
+            TASK_STATES.queued,
+            0,
+            null,
+            null,
+            null,
+            fanOutAt,
+            fanOutAt,
+            fanOutAt,
+            null,
+            null,
+            null,
+            null,
+            taskId,
+            child.sliceKey,
+          );
+        }
+
+        for (const child of normalized) {
+          const dependencyTaskIds = child.dependencySliceKeys
+            .map((dependencySliceKey) => childBySliceKey.get(dependencySliceKey).taskId)
+            .sort();
+          for (const dependencyTaskId of dependencyTaskIds) {
+            prepare(
+              'INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES(?, ?)',
+            ).run(child.taskId, dependencyTaskId);
+          }
+
+          appendEvent('task.created', 'task', child.taskId, {
+            taskId: child.taskId,
+            key: child.key,
+            payloadHash: child.payloadHash,
+            availableAt: fanOutAt,
+            dependencyIds: dependencyTaskIds,
+            parentTaskId: taskId,
+            sliceKey: child.sliceKey,
+          });
+        }
+
+        const update = prepare(
+          `UPDATE tasks
+           SET state = ?,
+               lease_owner = NULL,
+               claim_token = NULL,
+               claim_expires_at = NULL,
+               result_json = ?,
+               error_json = NULL,
+               updated_at = ?,
+               completed_at = NULL,
+               failed_at = NULL
+           WHERE task_id = ?
+             AND lease_owner = ?
+             AND generation = ?
+             AND claim_token = ?
+             AND state = ?
+             AND claim_expires_at >= ?`,
+        ).run(
+          TASK_STATES.waitingChildren,
+          mergedResultJson,
+          fanOutAt,
+          taskId,
+          worker,
+          generation,
+          claimToken,
+          TASK_STATES.running,
+          fanOutAt,
+        );
+        if (update.changes !== 1) {
+          throw new TaskConflictError('fan-out task fence changed during transaction', {
+            taskId,
+            worker,
+            generation,
+          });
+        }
+
+        appendEvent('task.fanned-out', 'task', taskId, {
+          taskId,
+          worker,
+          generation,
+          childTaskIds,
+          childSlices: normalized.map((child) => ({
+            taskId: child.taskId,
+            sliceKey: child.sliceKey,
+          })),
+          resultHash: canonicalHash(mergedResult),
+        });
+
+        return {
+          parent: hydrateTask(getTaskRowById(taskId)),
+          children: normalized.map((child) => hydrateTask(getTaskRowById(child.taskId))),
         };
       });
     },
@@ -1803,6 +2330,46 @@ export function openProjectStore(options) {
         const completedAt = now();
         const resultJson = canonicalStringify(result);
 
+        const current = prepare(
+          `SELECT task_id
+           FROM tasks
+           WHERE task_id = ?
+             AND lease_owner = ?
+             AND generation = ?
+             AND claim_token = ?
+             AND state = ?
+             AND claim_expires_at >= ?`,
+        ).get(
+          taskId,
+          worker,
+          generation,
+          claimToken,
+          TASK_STATES.running,
+          completedAt,
+        );
+        if (!current) {
+          return null;
+        }
+
+        const unsettledChild = prepare(
+          `SELECT task_id, state
+           FROM tasks
+           WHERE parent_task_id = ?
+             AND state NOT IN (?, ?)
+           ORDER BY created_at, task_id
+           LIMIT 1`,
+        ).get(taskId, TASK_STATES.completed, TASK_STATES.failed);
+        if (unsettledChild) {
+          throw new TaskConflictError(
+            `Task "${taskId}" cannot complete while child "${unsettledChild.task_id}" is ${unsettledChild.state}`,
+            {
+              taskId,
+              childTaskId: unsettledChild.task_id,
+              childState: unsettledChild.state,
+            },
+          );
+        }
+
         let outboxMessage = null;
         if (outbox) {
           requireString('outbox.channel', outbox.channel);
@@ -1858,12 +2425,14 @@ export function openProjectStore(options) {
           resultHash: canonicalHash(result),
         });
 
+        wakeSettledParents([taskId], completedAt);
+
         const task = hydrateTask(getTaskRowById(taskId));
         return outbox ? { task, outbox: outboxMessage } : task;
       });
     },
 
-    failTask({ taskId, worker, generation, claimToken, error }) {
+    failTask({ taskId, worker, generation, claimToken, error, preserveResult = false }) {
       requireString('taskId', taskId);
       requireString('worker', worker);
       requireString('claimToken', claimToken);
@@ -1878,7 +2447,7 @@ export function openProjectStore(options) {
                claim_token = NULL,
                claim_expires_at = NULL,
                error_json = ?,
-               result_json = NULL,
+               result_json = CASE WHEN ? THEN result_json ELSE NULL END,
                updated_at = ?,
                failed_at = ?,
                completed_at = NULL
@@ -1891,6 +2460,7 @@ export function openProjectStore(options) {
         ).run(
           TASK_STATES.failed,
           errorJson,
+          preserveResult ? 1 : 0,
           failedAt,
           failedAt,
           taskId,
@@ -1910,6 +2480,9 @@ export function openProjectStore(options) {
           worker,
           generation,
         });
+
+        const terminalTaskIds = failQueuedDependencyDescendants(taskId, failedAt);
+        wakeSettledParents(terminalTaskIds, failedAt);
 
         return hydrateTask(getTaskRowById(taskId));
       });
@@ -2035,7 +2608,87 @@ export function openProjectStore(options) {
 
       return withTransaction('IMMEDIATE', () => {
         const retriedAt = now();
+        const current = getTaskRowById(taskId);
+        if (
+          !current
+          || current.state !== TASK_STATES.failed
+          || current.generation !== expectedGeneration
+        ) {
+          return null;
+        }
+
+        const childRows = listTaskChildRows(taskId);
+        const hasChildren = childRows.length > 0;
+        const retriableFailedChildren = childRows.filter(
+          (childRow) => childRow.state === TASK_STATES.failed,
+        );
+        const activeChildren = childRows.filter(
+          (childRow) => !TERMINAL_TASK_STATES.has(childRow.state),
+        );
+        const needsChildRecovery = hasChildren
+          && (retriableFailedChildren.length > 0 || activeChildren.length > 0);
         const nextGeneration = expectedGeneration + 1;
+
+        if (hasChildren) {
+          const currentResult = parseJsonColumn(current.result_json);
+          const currentPlan = currentResult?.plan;
+          if (!currentPlan || typeof currentPlan !== 'object') {
+            throw new TaskConflictError(
+              'failed team root cannot be retried without a stored planner result.plan',
+              {
+                taskId,
+                generation: expectedGeneration,
+              },
+            );
+          }
+        }
+
+        if (needsChildRecovery) {
+          for (const childRow of retriableFailedChildren) {
+            const childNextGeneration = childRow.generation + 1;
+            const childUpdate = prepare(
+              `UPDATE tasks
+               SET state = ?,
+                   generation = ?,
+                   lease_owner = NULL,
+                   claim_token = NULL,
+                   claim_expires_at = NULL,
+                   available_at = ?,
+                   updated_at = ?,
+                   failed_at = NULL,
+                   completed_at = NULL,
+                   error_json = NULL,
+                   result_json = NULL
+               WHERE task_id = ?
+                 AND state = ?
+                 AND generation = ?`,
+            ).run(
+              TASK_STATES.queued,
+              childNextGeneration,
+              availableAt,
+              retriedAt,
+              childRow.task_id,
+              TASK_STATES.failed,
+              childRow.generation,
+            );
+            if (childUpdate.changes !== 1) {
+              throw new TaskConflictError('team child retry fence changed during transaction', {
+                parentTaskId: taskId,
+                taskId: childRow.task_id,
+                generation: childRow.generation,
+              });
+            }
+
+            appendEvent('task.retried', 'task', childRow.task_id, {
+              taskId: childRow.task_id,
+              previousGeneration: childRow.generation,
+              generation: childNextGeneration,
+              availableAt,
+              reason: `parent/team retry:${taskId}`,
+            });
+          }
+        }
+
         const update = prepare(
           `UPDATE tasks
            SET state = ?,
@@ -2046,12 +2699,13 @@ export function openProjectStore(options) {
                available_at = ?,
                updated_at = ?,
                failed_at = NULL,
+               completed_at = NULL,
                error_json = NULL
            WHERE task_id = ?
              AND state = ?
              AND generation = ?`,
         ).run(
-          TASK_STATES.queued,
+          needsChildRecovery ? TASK_STATES.waitingChildren : TASK_STATES.queued,
           nextGeneration,
           availableAt,
           retriedAt,
@@ -2059,7 +2713,12 @@ export function openProjectStore(options) {
           TASK_STATES.failed,
           expectedGeneration,
         );
-        if (update.changes !== 1) return null;
+        if (update.changes !== 1) {
+          throw new TaskConflictError('task retry fence changed during transaction', {
+            taskId,
+            generation: expectedGeneration,
+          });
+        }
 
         appendEvent('task.retried', 'task', taskId, {
           taskId,
@@ -2068,6 +2727,25 @@ export function openProjectStore(options) {
           availableAt,
           reason,
         });
+
+        if (needsChildRecovery) {
+          appendEvent('task.team-recovery', 'task', taskId, {
+            taskId,
+            availableAt,
+            generation: nextGeneration,
+            retriedChildTaskIds: retriableFailedChildren.map((childRow) => childRow.task_id),
+            reusedCompletedChildTaskIds: childRows
+              .filter((childRow) => childRow.state === TASK_STATES.completed)
+              .map((childRow) => childRow.task_id),
+            pendingChildTaskIds: activeChildren
+              .filter((childRow) => childRow.state === TASK_STATES.queued)
+              .map((childRow) => childRow.task_id),
+            runningChildTaskIds: activeChildren
+              .filter((childRow) => childRow.state === TASK_STATES.running)
+              .map((childRow) => childRow.task_id),
+          });
+        }
+
         return hydrateTask(getTaskRowById(taskId));
       });
     },

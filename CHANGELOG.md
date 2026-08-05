@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- add explicit `team add` and GUI team-task creation for one bounded high-level request;
+- add strict Planner, Reviewer, and Verifier output contracts with fail-closed parsing;
+- add schema-v3 parent/slice lineage, atomic five-child fan-out, `waiting_children`, dependency-failure propagation, and durable parent wake-up;
+- make failed team-root retry reuse the original DAG, completed siblings, and generation-fenced failed lineage instead of running Planner twice;
+- route Reviewer and Verifier worktrees from the Builder's exact candidate OID and inject only bounded untrusted handoffs;
+- publish one deterministic parent aggregate after independent review and required-check verification;
+- render a six-role roster and clickable Agent tree in the local GUI;
+- keep autonomous task invention, Project Brain write-back, merge, push, and destructive cleanup absent;
+
 - add a loopback-only local team GUI with task, adapter-activity, review, backpressure, and signed-event views;
 - add a resident `agent-team daemon` that runs the GUI and bounded worker slots continuously;
 - route daemon and GUI-triggered work through the same fenced `runWorkerOnce` execution boundary;

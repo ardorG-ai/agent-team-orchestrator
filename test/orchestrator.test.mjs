@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { runWorkerOnce } from '../src/orchestrator.mjs';
-import { openProjectStore } from '../src/project-store.mjs';
+import { OutboxBackpressureError, openProjectStore } from '../src/project-store.mjs';
 
 function createStoreHarness(name) {
   const root = mkdtempSync(path.join(os.tmpdir(), `${name}-`));
@@ -681,5 +681,1168 @@ test('runWorkerOnce treats heartbeat exceptions as lease loss and aborts without
     assert.equal(completeCalls, 0);
   } finally {
     await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
+function validTeamPlan() {
+  return {
+    schema: 'team.plan.v1',
+    summary: 'Implement and independently validate the requested behavior.',
+    assumptions: ['Public APIs remain compatible.'],
+    acceptanceCriteria: [{ id: 'ac-1', text: 'The requested behavior works.' }],
+    lanes: {
+      builder: { objective: 'Implement and commit the candidate.', scope: ['src/'] },
+      researcher: { objective: 'Report relevant constraints.', scope: [] },
+      test: { objective: 'Report required test coverage.', scope: ['test/'] },
+    },
+    requiredChecks: ['npm test'],
+  };
+}
+
+function makeTeamClaim(overrides = {}) {
+  return {
+    claimToken: 'team-claim',
+    generation: 1,
+    key: 'team/root',
+    parentTaskId: null,
+    payload: {
+      adapter: 'codex',
+      executionMode: 'planner',
+      role: 'planner',
+      scope: ['src/', 'test/'],
+      title: 'Ship a team change',
+    },
+    result: null,
+    sliceKey: null,
+    state: 'running',
+    taskId: 'team-parent',
+    worker: 'team-worker',
+    ...overrides,
+  };
+}
+
+function makeTeamStore({ claim, children = [], tasks = {} }) {
+  const calls = {
+    appendTaskEvent: [],
+    completeTask: [],
+    failTask: [],
+    fanOutTask: [],
+    requeueTaskLease: [],
+  };
+  return {
+    calls,
+    appendTaskEvent(input) {
+      calls.appendTaskEvent.push(input);
+      return true;
+    },
+    claimTask() {
+      return claim;
+    },
+    completeTask(input) {
+      calls.completeTask.push(input);
+      const task = { ...claim, result: input.result, state: 'completed' };
+      return input.outbox
+        ? { task, outbox: { ...input.outbox, state: 'pending' } }
+        : task;
+    },
+    failTask(input) {
+      calls.failTask.push(input);
+      return { ...claim, error: input.error, state: 'failed' };
+    },
+    fanOutTask(input) {
+      calls.fanOutTask.push(input);
+      return {
+        parent: { ...claim, result: input.result, state: 'waiting_children' },
+        children: input.children.map((child) => ({
+          ...child,
+          parentTaskId: claim.taskId,
+          state: 'queued',
+        })),
+      };
+    },
+    getTask(taskId) {
+      return tasks[taskId] ?? null;
+    },
+    heartbeatTask() {
+      return claim;
+    },
+    listTaskChildren() {
+      return children;
+    },
+    requeueExpiredTasks() {},
+    requeueTaskLease(input) {
+      calls.requeueTaskLease.push(input);
+      return { ...claim, state: 'queued' };
+    },
+  };
+}
+
+function completedTeamChild(sliceKey, overrides = {}) {
+  const adapter = sliceKey === 'researcher' || sliceKey === 'reviewer' ? 'claude' : 'codex';
+  return {
+    taskId: `team-${sliceKey}`,
+    key: `team/root::${sliceKey}`,
+    parentTaskId: 'team-parent',
+    payload: { adapter, role: sliceKey },
+    result: {
+      adapter,
+      baseOid: 'a'.repeat(40),
+      candidateOid: sliceKey === 'builder' ? 'b'.repeat(40) : 'a'.repeat(40),
+      finalMessage: `${sliceKey} complete`,
+    },
+    sliceKey,
+    state: 'completed',
+    ...overrides,
+  };
+}
+
+function completedTeamChildren() {
+  return [
+    completedTeamChild('builder'),
+    completedTeamChild('researcher'),
+    completedTeamChild('test'),
+    completedTeamChild('reviewer', {
+      result: {
+        adapter: 'claude',
+        baseOid: 'b'.repeat(40),
+        candidateOid: 'b'.repeat(40),
+        finalMessage: 'approved',
+        review: { schema: 'team.review.v1', verdict: 'APPROVED', findings: [] },
+      },
+    }),
+    completedTeamChild('verifier', {
+      result: {
+        adapter: 'codex',
+        baseOid: 'b'.repeat(40),
+        candidateOid: 'b'.repeat(40),
+        finalMessage: 'verified',
+        verification: {
+          schema: 'team.verify.v1',
+          verdict: 'PASS',
+          summary: 'All checks passed.',
+          checks: [{ name: 'npm test', status: 'PASS', evidence: 'passed' }],
+        },
+      },
+    }),
+  ];
+}
+
+test('runWorkerOnce parses a planner result and atomically fans out the fixed team DAG', async () => {
+  const worktreePath = await makeWorktreeRoot('team-planner');
+  const claim = makeTeamClaim({
+    payload: {
+      adapter: 'codex',
+      executionMode: 'planner',
+      role: 'planner',
+      scope: ['src/', 'test/'],
+      teamAdapters: { builder: 'claude', reviewer: 'codex' },
+      title: 'Ship a team change',
+    },
+  });
+  const store = makeTeamStore({ claim });
+  let generated = 0;
+
+  try {
+    const result = await runWorkerOnce({
+      adapters: {
+        codex: async () => ({
+          finalMessage: JSON.stringify(validTeamPlan()),
+          ok: true,
+          terminal: { status: 'success' },
+        }),
+      },
+      context: { repoRoot: worktreePath, worktreeRoot: path.dirname(worktreePath) },
+      createWorktree: async ({ ref }) => {
+        assert.equal(ref, 'HEAD');
+        return {
+          baseOid: 'a'.repeat(40),
+          branchName: 'team-parent-g1',
+          worktreePath,
+        };
+      },
+      generateTaskId: () => `generated-${++generated}`,
+      snapshotWorktree: async () => ({
+        candidateOid: 'a'.repeat(40),
+        clean: true,
+        worktreePath,
+      }),
+      store,
+      worker: claim.worker,
+    });
+
+    assert.equal(result.status, 'waiting-children');
+    assert.equal(store.calls.completeTask.length, 0);
+    assert.equal(store.calls.fanOutTask.length, 1);
+    const fanOut = store.calls.fanOutTask[0];
+    assert.equal(fanOut.result.plan.schema, 'team.plan.v1');
+    assert.deepEqual(fanOut.children.map((child) => child.sliceKey), [
+      'builder', 'researcher', 'test', 'reviewer', 'verifier',
+    ]);
+    assert.deepEqual(fanOut.children.map((child) => child.payload.adapter), [
+      'claude', 'claude', 'codex', 'codex', 'codex',
+    ]);
+    assert.deepEqual(fanOut.children[3].dependencySliceKeys, ['builder', 'researcher', 'test']);
+    assert.deepEqual(fanOut.children[4].dependencySliceKeys, ['reviewer']);
+  } finally {
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
+test('runWorkerOnce resolves reviewer base from the builder candidate and injects bounded handoff', async () => {
+  const worktreePath = await makeWorktreeRoot('team-reviewer');
+  const builder = completedTeamChild('builder');
+  const researcher = completedTeamChild('researcher');
+  const testReport = completedTeamChild('test');
+  const claim = makeTeamClaim({
+    key: 'team/root::reviewer',
+    parentTaskId: 'team-parent',
+    payload: {
+      adapter: 'claude',
+      baseFromTaskId: builder.taskId,
+      executionMode: 'review',
+      handoffTaskIds: [builder.taskId, researcher.taskId, testReport.taskId],
+      role: 'reviewer',
+      scope: ['src/', 'test/'],
+      title: 'Review candidate',
+    },
+    sliceKey: 'reviewer',
+    taskId: 'team-reviewer',
+  });
+  const store = makeTeamStore({
+    claim,
+    tasks: Object.fromEntries([builder, researcher, testReport].map((task) => [task.taskId, task])),
+  });
+  let promptContext;
+
+  try {
+    const result = await runWorkerOnce({
+      adapters: {
+        claude: async () => ({
+          finalMessage: JSON.stringify({
+            schema: 'team.review.v1',
+            verdict: 'APPROVED',
+            findings: [],
+          }),
+          ok: true,
+          terminal: { status: 'success' },
+        }),
+      },
+      buildPrompt: (_task, _claim, context) => {
+        promptContext = context;
+        return 'review prompt';
+      },
+      context: { repoRoot: worktreePath, worktreeRoot: path.dirname(worktreePath) },
+      createWorktree: async ({ ref }) => {
+        assert.equal(ref, 'b'.repeat(40));
+        return {
+          baseOid: 'b'.repeat(40),
+          branchName: 'team-reviewer-g1',
+          worktreePath,
+        };
+      },
+      snapshotWorktree: async () => ({
+        candidateOid: 'b'.repeat(40),
+        clean: true,
+        worktreePath,
+      }),
+      store,
+      worker: claim.worker,
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.match(promptContext.handoff, /UNTRUSTED HANDOFF DATA/);
+    assert.match(promptContext.handoff, /team-builder/);
+    assert.ok(Buffer.byteLength(promptContext.handoff, 'utf8') <= 12 * 1024);
+    assert.equal(store.calls.completeTask.length, 1);
+    assert.equal(store.calls.completeTask[0].outbox, undefined);
+    assert.equal(store.calls.completeTask[0].result.review.verdict, 'APPROVED');
+  } finally {
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
+test('runWorkerOnce fails closed before worktree creation when a dynamic base is not completed', async () => {
+  const builder = {
+    ...completedTeamChild('builder'),
+    result: null,
+    state: 'queued',
+  };
+  const claim = makeTeamClaim({
+    key: 'team/root::reviewer',
+    parentTaskId: 'team-parent',
+    payload: {
+      adapter: 'claude',
+      baseFromTaskId: builder.taskId,
+      executionMode: 'review',
+      handoffTaskIds: [],
+      role: 'reviewer',
+      title: 'Review candidate',
+    },
+    sliceKey: 'reviewer',
+    taskId: 'team-reviewer',
+  });
+  const store = makeTeamStore({ claim, tasks: { [builder.taskId]: builder } });
+  let worktreeCreated = false;
+
+  const result = await runWorkerOnce({
+    context: { repoRoot: process.cwd(), worktreeRoot: os.tmpdir() },
+    createWorktree: async () => {
+      worktreeCreated = true;
+      throw new Error('unexpected worktree');
+    },
+    store,
+    worker: claim.worker,
+  });
+
+  assert.equal(result.status, 'failed');
+  assert.equal(worktreeCreated, false);
+  assert.match(store.calls.failTask[0].error.message, /must be completed/i);
+});
+
+test('runWorkerOnce rejects root-level dynamic base and handoff references before worktree creation', async () => {
+  const foreign = completedTeamChild('builder');
+  const cases = [
+    {
+      payload: {
+        adapter: 'claude',
+        baseFromTaskId: foreign.taskId,
+        executionMode: 'review',
+        handoffTaskIds: [],
+        role: 'reviewer',
+        title: 'Root review',
+      },
+      message: /baseFromTaskId requires a parent team task/i,
+    },
+    {
+      payload: {
+        adapter: 'claude',
+        executionMode: 'report',
+        handoffTaskIds: [foreign.taskId],
+        role: 'researcher',
+        title: 'Root report',
+      },
+      message: /handoffTaskIds requires a parent team task/i,
+    },
+  ];
+
+  for (const [index, entry] of cases.entries()) {
+    const claim = makeTeamClaim({
+      key: `root-reference-${index}`,
+      parentTaskId: null,
+      payload: entry.payload,
+      sliceKey: null,
+      taskId: `root-reference-${index}`,
+    });
+    const store = makeTeamStore({ claim, tasks: { [foreign.taskId]: foreign } });
+    let worktreeCreated = false;
+    const result = await runWorkerOnce({
+      context: { repoRoot: process.cwd(), worktreeRoot: os.tmpdir() },
+      createWorktree: async () => {
+        worktreeCreated = true;
+        throw new Error('unexpected worktree');
+      },
+      store,
+      worker: claim.worker,
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.equal(worktreeCreated, false);
+    assert.match(store.calls.failTask[0].error.message, entry.message);
+  }
+});
+
+test('runWorkerOnce fails closed when a read-only team role changes HEAD', async () => {
+  const worktreePath = await makeWorktreeRoot('team-readonly-change');
+  const claim = makeTeamClaim({
+    key: 'team/root::researcher',
+    parentTaskId: 'team-parent',
+    payload: {
+      adapter: 'claude',
+      executionMode: 'report',
+      role: 'researcher',
+      title: 'Research only',
+    },
+    sliceKey: 'researcher',
+    taskId: 'team-researcher',
+  });
+  const store = makeTeamStore({ claim });
+
+  try {
+    const result = await runWorkerOnce({
+      adapters: {
+        claude: async () => ({
+          finalMessage: 'Research report.',
+          ok: true,
+          terminal: { status: 'success' },
+        }),
+      },
+      buildPrompt: () => 'prompt',
+      context: { repoRoot: worktreePath, worktreeRoot: path.dirname(worktreePath) },
+      createWorktree: async () => ({
+        baseOid: 'a'.repeat(40),
+        branchName: 'team-researcher-g1',
+        worktreePath,
+      }),
+      snapshotWorktree: async () => ({
+        candidateOid: 'b'.repeat(40),
+        clean: true,
+        worktreePath,
+      }),
+      store,
+      worker: claim.worker,
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.match(store.calls.failTask[0].error.message, /must not modify or commit/i);
+  } finally {
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
+test('runWorkerOnce fails closed when a team builder produces no candidate commit', async () => {
+  const worktreePath = await makeWorktreeRoot('team-build-no-commit');
+  const claim = makeTeamClaim({
+    key: 'team/root::builder',
+    parentTaskId: 'team-parent',
+    payload: {
+      adapter: 'codex',
+      executionMode: 'build',
+      role: 'builder',
+      title: 'Build candidate',
+    },
+    sliceKey: 'builder',
+    taskId: 'team-builder',
+  });
+  const store = makeTeamStore({ claim });
+
+  try {
+    const result = await runWorkerOnce({
+      adapters: {
+        codex: async () => ({
+          finalMessage: 'No changes were needed.',
+          ok: true,
+          terminal: { status: 'success' },
+        }),
+      },
+      buildPrompt: () => 'prompt',
+      context: { repoRoot: worktreePath, worktreeRoot: path.dirname(worktreePath) },
+      createWorktree: async () => ({
+        baseOid: 'a'.repeat(40),
+        branchName: 'team-builder-g1',
+        worktreePath,
+      }),
+      snapshotWorktree: async () => ({
+        candidateOid: 'a'.repeat(40),
+        clean: true,
+        worktreePath,
+      }),
+      store,
+      worker: claim.worker,
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.match(store.calls.failTask[0].error.message, /new candidate commit/i);
+  } finally {
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
+test('runWorkerOnce fails a review task whose verdict is not strict team.review.v1 JSON', async () => {
+  const worktreePath = await makeWorktreeRoot('team-invalid-review');
+  const builder = completedTeamChild('builder');
+  const claim = makeTeamClaim({
+    key: 'team/root::reviewer',
+    parentTaskId: 'team-parent',
+    payload: {
+      adapter: 'claude',
+      baseFromTaskId: builder.taskId,
+      executionMode: 'review',
+      handoffTaskIds: [builder.taskId],
+      role: 'reviewer',
+      title: 'Review candidate',
+    },
+    sliceKey: 'reviewer',
+    taskId: 'team-reviewer',
+  });
+  const store = makeTeamStore({ claim, tasks: { [builder.taskId]: builder } });
+
+  try {
+    const result = await runWorkerOnce({
+      adapters: {
+        claude: async () => ({
+          finalMessage: 'APPROVED',
+          ok: true,
+          terminal: { status: 'success' },
+        }),
+      },
+      buildPrompt: () => 'prompt',
+      context: { repoRoot: worktreePath, worktreeRoot: path.dirname(worktreePath) },
+      createWorktree: async () => ({
+        baseOid: 'b'.repeat(40),
+        branchName: 'team-reviewer-g1',
+        worktreePath,
+      }),
+      snapshotWorktree: async () => ({
+        candidateOid: 'b'.repeat(40),
+        clean: true,
+        worktreePath,
+      }),
+      store,
+      worker: claim.worker,
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.match(store.calls.failTask[0].error.message, /valid JSON/i);
+  } finally {
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
+test('runWorkerOnce aggregates a resumed planner without launching a CLI or worktree', async () => {
+  const claim = makeTeamClaim({
+    generation: 2,
+    result: { plan: validTeamPlan(), team: { phase: 'waiting-children' } },
+  });
+  const children = completedTeamChildren();
+  const store = makeTeamStore({ claim, children });
+
+  const result = await runWorkerOnce({
+    adapters: {
+      codex: async () => {
+        throw new Error('aggregate must not launch an adapter');
+      },
+    },
+    context: { repoRoot: process.cwd(), worktreeRoot: os.tmpdir() },
+    createWorktree: async () => {
+      throw new Error('aggregate must not create a worktree');
+    },
+    store,
+    worker: claim.worker,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.task.result.verdict, 'READY_FOR_HUMAN');
+  assert.equal(result.task.result.candidateOid, 'b'.repeat(40));
+  assert.equal(store.calls.completeTask.length, 1);
+  const completion = store.calls.completeTask[0];
+  assert.equal(completion.outbox.messageId, 'team:team-parent:g2');
+  assert.deepEqual(completion.outbox.payload.childTaskIds, children.map((child) => child.taskId));
+  assert.equal(completion.outbox.payload.verdict, 'READY_FOR_HUMAN');
+});
+
+test('runWorkerOnce fails a resumed planner when any child failed', async () => {
+  const claim = makeTeamClaim({
+    generation: 2,
+    result: { plan: validTeamPlan(), team: { phase: 'waiting-children' } },
+  });
+  const children = completedTeamChildren().map((child) => (
+    child.sliceKey === 'test'
+      ? { ...child, error: { message: 'test agent failed' }, result: null, state: 'failed' }
+      : child
+  ));
+  const store = makeTeamStore({ claim, children });
+
+  const result = await runWorkerOnce({
+    context: { repoRoot: process.cwd(), worktreeRoot: os.tmpdir() },
+    createWorktree: async () => {
+      throw new Error('aggregate must not create a worktree');
+    },
+    store,
+    worker: claim.worker,
+  });
+
+  assert.equal(result.status, 'failed');
+  assert.equal(store.calls.completeTask.length, 0);
+  assert.equal(store.calls.failTask.length, 1);
+  assert.equal(store.calls.failTask[0].preserveResult, true);
+  assert.match(store.calls.failTask[0].error.message, /test/i);
+});
+
+test('runWorkerOnce requeues a resumed planner when the final team review outbox is full', async () => {
+  const claim = makeTeamClaim({
+    generation: 2,
+    result: { plan: validTeamPlan(), team: { phase: 'waiting-children' } },
+  });
+  const store = makeTeamStore({ claim, children: completedTeamChildren() });
+  store.completeTask = (input) => {
+    store.calls.completeTask.push(input);
+    throw new OutboxBackpressureError('full', { channel: 'review' });
+  };
+
+  const result = await runWorkerOnce({
+    context: { repoRoot: process.cwd(), worktreeRoot: os.tmpdir() },
+    store,
+    worker: claim.worker,
+  });
+
+  assert.equal(result.status, 'backpressure');
+  assert.equal(store.calls.requeueTaskLease.length, 1);
+  assert.equal(result.task.state, 'queued');
+});
+
+test('real store executes the fixed team lifecycle and wakes the planner for final aggregation', async () => {
+  const harness = createStoreHarness('orchestrator-team-lifecycle');
+  const store = harness.open();
+  const runtimeRoot = await makeWorktreeRoot('team-lifecycle');
+  const baseOid = 'a'.repeat(40);
+  const candidateOid = 'b'.repeat(40);
+  const roleByWorktree = new Map();
+  let generated = 0;
+
+  try {
+    store.configureChannel({ channel: 'review', capacity: 3 });
+    const parent = store.createTask({
+      key: 'team-lifecycle',
+      payload: {
+        adapter: 'codex',
+        executionMode: 'planner',
+        role: 'planner',
+        scope: ['src/', 'test/'],
+        title: 'Exercise the complete team lifecycle',
+      },
+    }).task;
+
+    const createWorktree = async ({ generation, ref, task }) => {
+      const current = store.getTask(task);
+      const role = current.payload.role;
+      const expectedRef = role === 'planner' ? 'HEAD'
+        : role === 'reviewer' || role === 'verifier' ? candidateOid
+          : baseOid;
+      assert.equal(ref, expectedRef);
+      const worktreePath = path.join(runtimeRoot, `${task}-g${generation}`);
+      roleByWorktree.set(worktreePath, role);
+      return {
+        baseOid: ref === 'HEAD' ? baseOid : ref,
+        branchName: `${task}-g${generation}`,
+        worktreePath,
+      };
+    };
+    const runAdapter = async ({ cwd }) => {
+      const role = roleByWorktree.get(cwd);
+      const finalMessage = role === 'planner'
+        ? JSON.stringify(validTeamPlan())
+        : role === 'reviewer'
+          ? JSON.stringify({
+            schema: 'team.review.v1',
+            verdict: 'APPROVED',
+            findings: [],
+          })
+          : role === 'verifier'
+            ? JSON.stringify({
+              schema: 'team.verify.v1',
+              verdict: 'PASS',
+              summary: 'The exact candidate passed the required checks.',
+              checks: [{ name: 'npm test', status: 'PASS', evidence: 'all tests passed' }],
+            })
+            : `${role} completed its bounded assignment.`;
+      return { finalMessage, ok: true, terminal: { status: 'success' } };
+    };
+    const snapshotWorktree = async ({ worktreePath }) => {
+      const role = roleByWorktree.get(worktreePath);
+      return {
+        candidateOid: role === 'builder' ? candidateOid
+          : role === 'reviewer' || role === 'verifier' ? candidateOid
+            : baseOid,
+        clean: true,
+        worktreePath,
+      };
+    };
+    const commonOptions = {
+      adapters: { claude: runAdapter, codex: runAdapter },
+      context: harness.context,
+      createWorktree,
+      generateTaskId: () => `team-child-${++generated}`,
+      snapshotWorktree,
+      store,
+    };
+
+    const planned = await runWorkerOnce({
+      ...commonOptions,
+      taskId: parent.taskId,
+      worker: 'planner-worker',
+    });
+    assert.equal(planned.status, 'waiting-children');
+    assert.equal(store.getTask(parent.taskId).state, 'waiting_children');
+
+    const childBySlice = Object.fromEntries(
+      store.listTaskChildren(parent.taskId).map((child) => [child.sliceKey, child]),
+    );
+    for (const sliceKey of ['builder', 'researcher', 'test', 'reviewer', 'verifier']) {
+      const execution = await runWorkerOnce({
+        ...commonOptions,
+        taskId: childBySlice[sliceKey].taskId,
+        worker: `${sliceKey}-worker`,
+      });
+      assert.equal(execution.status, 'completed', `${sliceKey} should complete`);
+    }
+
+    assert.equal(store.getTask(parent.taskId).state, 'queued');
+    const aggregated = await runWorkerOnce({
+      ...commonOptions,
+      createWorktree: async () => {
+        throw new Error('resumed planner must not create another worktree');
+      },
+      taskId: parent.taskId,
+      worker: 'aggregate-worker',
+    });
+
+    assert.equal(aggregated.status, 'completed');
+    assert.equal(aggregated.task.result.verdict, 'READY_FOR_HUMAN');
+    assert.equal(aggregated.task.result.candidateOid, candidateOid);
+    assert.equal(store.listTaskChildren(parent.taskId).length, 5);
+    const delivery = store.getOutboxMessage(`team:${parent.taskId}:g2`);
+    assert.equal(delivery.payload.verdict, 'READY_FOR_HUMAN');
+    assert.equal(delivery.payload.candidateOid, candidateOid);
+    assert.equal(store.getOutboxMessage(`candidate:${childBySlice.builder.taskId}:g1`), null);
+    assert.equal(store.verifyEventLog().ok, true);
+  } finally {
+    store.close();
+    harness.cleanup();
+    await fs.rm(runtimeRoot, { force: true, recursive: true });
+  }
+});
+
+test('real store retries a failed team root by reusing successful children and re-aggregating without another fan-out', async () => {
+  const harness = createStoreHarness('orchestrator-team-retry');
+  const store = harness.open();
+  const runtimeRoot = await makeWorktreeRoot('team-retry');
+  const baseOid = 'a'.repeat(40);
+  const candidateOid = 'b'.repeat(40);
+  const roleByWorktree = new Map();
+  let generated = 0;
+  let builderAttempts = 0;
+
+  try {
+    store.configureChannel({ channel: 'review', capacity: 3 });
+    const parent = store.createTask({
+      key: 'team-retry-root',
+      payload: {
+        adapter: 'codex',
+        executionMode: 'planner',
+        role: 'planner',
+        scope: ['src/', 'test/'],
+        title: 'Recover a failed team root without a second fan-out',
+      },
+    }).task;
+
+    const createWorktree = async ({ generation, ref, task }) => {
+      const current = store.getTask(task);
+      const role = current.payload.role;
+      const expectedRef = role === 'planner' ? 'HEAD'
+        : role === 'reviewer' || role === 'verifier' ? candidateOid
+          : baseOid;
+      assert.equal(ref, expectedRef);
+      const worktreePath = path.join(runtimeRoot, `${task}-g${generation}`);
+      roleByWorktree.set(worktreePath, role);
+      return {
+        baseOid: ref === 'HEAD' ? baseOid : ref,
+        branchName: `${task}-g${generation}`,
+        worktreePath,
+      };
+    };
+    const runAdapter = async ({ cwd }) => {
+      const role = roleByWorktree.get(cwd);
+      if (role === 'planner') {
+        return {
+          finalMessage: JSON.stringify(validTeamPlan()),
+          ok: true,
+          terminal: { status: 'success' },
+        };
+      }
+      if (role === 'builder') {
+        builderAttempts += 1;
+        if (builderAttempts === 1) {
+          return {
+            finalMessage: 'builder failed on first attempt',
+            ok: false,
+            terminal: { status: 'failure', message: 'builder failed on first attempt' },
+          };
+        }
+        return {
+          finalMessage: 'builder recovered and produced a candidate',
+          ok: true,
+          terminal: { status: 'success' },
+        };
+      }
+      if (role === 'reviewer') {
+        return {
+          finalMessage: JSON.stringify({
+            schema: 'team.review.v1',
+            verdict: 'APPROVED',
+            findings: [],
+          }),
+          ok: true,
+          terminal: { status: 'success' },
+        };
+      }
+      if (role === 'verifier') {
+        return {
+          finalMessage: JSON.stringify({
+            schema: 'team.verify.v1',
+            verdict: 'PASS',
+            summary: 'Recovered candidate passed verification.',
+            checks: [{ name: 'npm test', status: 'PASS', evidence: 'recovery path passed' }],
+          }),
+          ok: true,
+          terminal: { status: 'success' },
+        };
+      }
+      return {
+        finalMessage: `${role} completed its bounded assignment.`,
+        ok: true,
+        terminal: { status: 'success' },
+      };
+    };
+    const snapshotWorktree = async ({ worktreePath }) => {
+      const role = roleByWorktree.get(worktreePath);
+      return {
+        candidateOid: role === 'builder' ? candidateOid
+          : role === 'reviewer' || role === 'verifier' ? candidateOid
+            : baseOid,
+        clean: true,
+        worktreePath,
+      };
+    };
+    const commonOptions = {
+      adapters: { claude: runAdapter, codex: runAdapter },
+      context: harness.context,
+      createWorktree,
+      generateTaskId: () => `team-retry-child-${++generated}`,
+      snapshotWorktree,
+      store,
+    };
+
+    const planned = await runWorkerOnce({
+      ...commonOptions,
+      taskId: parent.taskId,
+      worker: 'planner-worker',
+    });
+    assert.equal(planned.status, 'waiting-children');
+
+    const initialChildren = store.listTaskChildren(parent.taskId);
+    const initialChildIds = initialChildren.map((child) => child.taskId);
+    const childBySlice = Object.fromEntries(initialChildren.map((child) => [child.sliceKey, child]));
+
+    const firstBuilder = await runWorkerOnce({
+      ...commonOptions,
+      taskId: childBySlice.builder.taskId,
+      worker: 'builder-worker',
+    });
+    assert.equal(firstBuilder.status, 'failed');
+
+    const researcher = await runWorkerOnce({
+      ...commonOptions,
+      taskId: childBySlice.researcher.taskId,
+      worker: 'researcher-worker',
+    });
+    assert.equal(researcher.status, 'completed');
+
+    const tester = await runWorkerOnce({
+      ...commonOptions,
+      taskId: childBySlice.test.taskId,
+      worker: 'test-worker',
+    });
+    assert.equal(tester.status, 'completed');
+
+    assert.equal(store.getTask(childBySlice.reviewer.taskId).state, 'failed');
+    assert.equal(store.getTask(childBySlice.verifier.taskId).state, 'failed');
+    assert.equal(store.getTask(parent.taskId).state, 'queued');
+
+    const failedAggregate = await runWorkerOnce({
+      ...commonOptions,
+      createWorktree: async () => {
+        throw new Error('aggregate retry path must not recreate the planner worktree');
+      },
+      taskId: parent.taskId,
+      worker: 'aggregate-worker',
+    });
+    assert.equal(failedAggregate.status, 'failed');
+
+    const failedParent = store.getTask(parent.taskId);
+    assert.equal(failedParent.state, 'failed');
+    assert.deepEqual(failedParent.result.plan, validTeamPlan());
+
+    const retriedParent = store.retryFailedTask({
+      taskId: parent.taskId,
+      expectedGeneration: failedParent.generation,
+      reason: 'recover failed team root',
+    });
+    assert.equal(retriedParent.state, 'waiting_children');
+    assert.deepEqual(retriedParent.result.plan, validTeamPlan());
+    assert.deepEqual(
+      store.listTaskChildren(parent.taskId).map((child) => child.taskId),
+      initialChildIds,
+    );
+    assert.equal(store.getTask(childBySlice.researcher.taskId).state, 'completed');
+    assert.equal(store.getTask(childBySlice.test.taskId).state, 'completed');
+    assert.equal(store.getTask(childBySlice.builder.taskId).state, 'queued');
+    assert.equal(store.getTask(childBySlice.reviewer.taskId).state, 'queued');
+    assert.equal(store.getTask(childBySlice.verifier.taskId).state, 'queued');
+
+    const rootWhileWaiting = await runWorkerOnce({
+      ...commonOptions,
+      taskId: parent.taskId,
+      worker: 'aggregate-worker',
+    });
+    assert.equal(rootWhileWaiting.status, 'idle');
+
+    const reviewerBeforeBuilder = await runWorkerOnce({
+      ...commonOptions,
+      taskId: childBySlice.reviewer.taskId,
+      worker: 'reviewer-worker',
+    });
+    assert.equal(reviewerBeforeBuilder.status, 'idle');
+
+    const recoveredBuilder = await runWorkerOnce({
+      ...commonOptions,
+      taskId: childBySlice.builder.taskId,
+      worker: 'builder-worker',
+    });
+    assert.equal(recoveredBuilder.status, 'completed');
+
+    const verifierBeforeReviewer = await runWorkerOnce({
+      ...commonOptions,
+      taskId: childBySlice.verifier.taskId,
+      worker: 'verifier-worker',
+    });
+    assert.equal(verifierBeforeReviewer.status, 'idle');
+
+    const recoveredReviewer = await runWorkerOnce({
+      ...commonOptions,
+      taskId: childBySlice.reviewer.taskId,
+      worker: 'reviewer-worker',
+    });
+    assert.equal(recoveredReviewer.status, 'completed');
+
+    const recoveredVerifier = await runWorkerOnce({
+      ...commonOptions,
+      taskId: childBySlice.verifier.taskId,
+      worker: 'verifier-worker',
+    });
+    assert.equal(recoveredVerifier.status, 'completed');
+
+    assert.equal(store.getTask(parent.taskId).state, 'queued');
+
+    const recoveredAggregate = await runWorkerOnce({
+      ...commonOptions,
+      createWorktree: async () => {
+        throw new Error('recovered aggregate must not rerun planner fan-out');
+      },
+      taskId: parent.taskId,
+      worker: 'aggregate-worker',
+    });
+    assert.equal(recoveredAggregate.status, 'completed');
+    assert.equal(recoveredAggregate.task.result.verdict, 'READY_FOR_HUMAN');
+    assert.equal(recoveredAggregate.task.result.candidateOid, candidateOid);
+    assert.equal(builderAttempts, 2);
+    assert.deepEqual(
+      store.listTaskChildren(parent.taskId).map((child) => child.taskId),
+      initialChildIds,
+    );
+    assert.equal(store.listTaskChildren(parent.taskId).length, 5);
+    assert.equal(store.getTask(childBySlice.researcher.taskId).generation, 1);
+    assert.equal(store.getTask(childBySlice.test.taskId).generation, 1);
+    assert.equal(store.getTask(childBySlice.builder.taskId).generation, 3);
+    assert.equal(store.getTask(childBySlice.reviewer.taskId).generation, 2);
+    assert.equal(store.getTask(childBySlice.verifier.taskId).generation, 2);
+
+    const teamRetriedEvents = store
+      .listEventLog()
+      .filter((event) => event.kind === 'task.retried')
+      .map((event) => JSON.parse(event.payload_json));
+    assert.deepEqual(
+      teamRetriedEvents.map((event) => [event.taskId, event.reason]).sort((a, b) => a[0].localeCompare(b[0])),
+      [
+        [parent.taskId, 'recover failed team root'],
+        [childBySlice.builder.taskId, `parent/team retry:${parent.taskId}`],
+        [childBySlice.reviewer.taskId, `parent/team retry:${parent.taskId}`],
+        [childBySlice.verifier.taskId, `parent/team retry:${parent.taskId}`],
+      ],
+    );
+    assert.equal(store.verifyEventLog().ok, true);
+  } finally {
+    store.close();
+    harness.cleanup();
+    await fs.rm(runtimeRoot, { force: true, recursive: true });
+  }
+});
+
+test('real store retries a failed aggregate-only team root without touching completed children or relaunching a CLI', async () => {
+  const harness = createStoreHarness('orchestrator-team-aggregate-retry');
+  const store = harness.open();
+  const runtimeRoot = await makeWorktreeRoot('team-aggregate-retry');
+  const baseOid = 'a'.repeat(40);
+  const candidateOid = 'b'.repeat(40);
+  const roleByWorktree = new Map();
+  let generated = 0;
+
+  try {
+    store.configureChannel({ channel: 'review', capacity: 3 });
+    const parent = store.createTask({
+      key: 'team-aggregate-retry-root',
+      payload: {
+        adapter: 'codex',
+        executionMode: 'planner',
+        role: 'planner',
+        scope: ['src/', 'test/'],
+        title: 'Retry only the final aggregate step.',
+      },
+    }).task;
+
+    const createWorktree = async ({ generation, ref, task }) => {
+      const current = store.getTask(task);
+      const role = current.payload.role;
+      const expectedRef = role === 'planner' ? 'HEAD'
+        : role === 'reviewer' || role === 'verifier' ? candidateOid
+          : baseOid;
+      assert.equal(ref, expectedRef);
+      const worktreePath = path.join(runtimeRoot, `${task}-g${generation}`);
+      roleByWorktree.set(worktreePath, role);
+      return {
+        baseOid: ref === 'HEAD' ? baseOid : ref,
+        branchName: `${task}-g${generation}`,
+        worktreePath,
+      };
+    };
+    const runAdapter = async ({ cwd }) => {
+      const role = roleByWorktree.get(cwd);
+      if (role === 'planner') {
+        return {
+          finalMessage: JSON.stringify(validTeamPlan()),
+          ok: true,
+          terminal: { status: 'success' },
+        };
+      }
+      if (role === 'reviewer') {
+        return {
+          finalMessage: JSON.stringify({
+            schema: 'team.review.v1',
+            verdict: 'APPROVED',
+            findings: [],
+          }),
+          ok: true,
+          terminal: { status: 'success' },
+        };
+      }
+      if (role === 'verifier') {
+        return {
+          finalMessage: JSON.stringify({
+            schema: 'team.verify.v1',
+            verdict: 'PASS',
+            summary: 'Recovered aggregate-only retry passed verification.',
+            checks: [{ name: 'npm test', status: 'PASS', evidence: 'aggregate-only retry passed' }],
+          }),
+          ok: true,
+          terminal: { status: 'success' },
+        };
+      }
+      return {
+        finalMessage: `${role} completed its bounded assignment.`,
+        ok: true,
+        terminal: { status: 'success' },
+      };
+    };
+    const snapshotWorktree = async ({ worktreePath }) => {
+      const role = roleByWorktree.get(worktreePath);
+      return {
+        candidateOid: role === 'builder' ? candidateOid
+          : role === 'reviewer' || role === 'verifier' ? candidateOid
+            : baseOid,
+        clean: true,
+        worktreePath,
+      };
+    };
+    const commonOptions = {
+      adapters: { claude: runAdapter, codex: runAdapter },
+      context: harness.context,
+      createWorktree,
+      generateTaskId: () => `team-aggregate-retry-child-${++generated}`,
+      snapshotWorktree,
+      store,
+    };
+
+    const planned = await runWorkerOnce({
+      ...commonOptions,
+      taskId: parent.taskId,
+      worker: 'planner-worker',
+    });
+    assert.equal(planned.status, 'waiting-children');
+
+    const children = store.listTaskChildren(parent.taskId);
+    const childIds = children.map((child) => child.taskId);
+    const childBySlice = Object.fromEntries(children.map((child) => [child.sliceKey, child]));
+
+    for (const sliceKey of ['builder', 'researcher', 'test', 'reviewer', 'verifier']) {
+      const execution = await runWorkerOnce({
+        ...commonOptions,
+        taskId: childBySlice[sliceKey].taskId,
+        worker: `${sliceKey}-worker`,
+      });
+      assert.equal(execution.status, 'completed', `${sliceKey} should complete before retry`);
+    }
+
+    assert.equal(store.getTask(parent.taskId).state, 'queued');
+    const childGenerationsBeforeRetry = Object.fromEntries(
+      children.map((child) => [child.taskId, store.getTask(child.taskId).generation]),
+    );
+
+    const aggregateClaim = store.claimTask({ worker: 'aggregate-worker', taskId: parent.taskId });
+    const failedParent = store.failTask({
+      taskId: aggregateClaim.taskId,
+      worker: aggregateClaim.worker,
+      generation: aggregateClaim.generation,
+      claimToken: aggregateClaim.claimToken,
+      error: new Error('aggregate interrupted after all children completed'),
+      preserveResult: true,
+    });
+    assert.deepEqual(failedParent.result.plan, validTeamPlan());
+
+    const retriedParent = store.retryFailedTask({
+      taskId: failedParent.taskId,
+      expectedGeneration: failedParent.generation,
+      reason: 'retry aggregate only',
+    });
+    assert.equal(retriedParent.state, 'queued');
+    assert.deepEqual(retriedParent.result.plan, validTeamPlan());
+    assert.deepEqual(
+      Object.fromEntries(children.map((child) => [child.taskId, store.getTask(child.taskId).generation])),
+      childGenerationsBeforeRetry,
+    );
+
+    const teamRecoveryEvents = store.listEventLog()
+      .filter((event) => event.kind === 'task.team-recovery');
+    assert.equal(teamRecoveryEvents.length, 0);
+
+    const aggregated = await runWorkerOnce({
+      ...commonOptions,
+      adapters: {
+        claude: async () => {
+          throw new Error('aggregate-only retry must not relaunch an adapter');
+        },
+        codex: async () => {
+          throw new Error('aggregate-only retry must not relaunch an adapter');
+        },
+      },
+      createWorktree: async () => {
+        throw new Error('aggregate-only retry must not recreate a worktree');
+      },
+      taskId: parent.taskId,
+      worker: 'aggregate-worker',
+    });
+    assert.equal(aggregated.status, 'completed');
+    assert.equal(aggregated.task.result.verdict, 'READY_FOR_HUMAN');
+    assert.equal(aggregated.task.result.candidateOid, candidateOid);
+    assert.deepEqual(store.listTaskChildren(parent.taskId).map((child) => child.taskId), childIds);
+
+    const teamOutbox = store.listOutbox()
+      .filter((message) => message.messageId.startsWith(`team:${parent.taskId}:`));
+    assert.equal(teamOutbox.length, 1);
+    assert.equal(teamOutbox[0].payload.verdict, 'READY_FOR_HUMAN');
+    assert.equal(teamOutbox[0].payload.candidateOid, candidateOid);
+    assert.equal(store.verifyEventLog().ok, true);
+  } finally {
+    store.close();
+    harness.cleanup();
+    await fs.rm(runtimeRoot, { force: true, recursive: true });
   }
 });

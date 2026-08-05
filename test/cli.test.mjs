@@ -76,6 +76,90 @@ test('CLI initializes a project, creates an idempotent task, and verifies events
   assert.equal(integrity.database, 'ok');
 });
 
+test('team add creates an idempotent Planner root with explicit role adapter routing', async () => {
+  const { repo, stateRoot } = createRepository();
+  await executeCli(['init', ...projectArgs(repo, stateRoot)]);
+  const prerequisite = await executeCli([
+    'task', 'add',
+    '--title', 'Prepare contract',
+    '--idempotency-key', 'team-prerequisite',
+    ...projectArgs(repo, stateRoot),
+  ]);
+
+  const args = [
+    'team', 'add',
+    '--title', 'Ship the team slice',
+    '--description', 'Plan, build, review, and independently verify the change.',
+    '--adapter', 'claude',
+    '--builder-adapter', 'claude',
+    '--researcher-adapter', 'codex',
+    '--test-adapter', 'claude',
+    '--reviewer-adapter', 'codex',
+    '--verifier-adapter', 'claude',
+    '--scope', 'src,test',
+    '--depends', prerequisite.task.taskId,
+    '--base', 'HEAD',
+    '--idempotency-key', 'team-root',
+    ...projectArgs(repo, stateRoot),
+  ];
+  const added = await executeCli(args);
+  const replay = await executeCli(args);
+
+  assert.equal(added.status, 'created');
+  assert.equal(replay.status, 'replayed');
+  assert.equal(replay.task.taskId, added.task.taskId);
+  assert.deepEqual(added.task.dependencies, [prerequisite.task.taskId]);
+  assert.deepEqual(added.task.payload, {
+    adapter: 'claude',
+    baseOid: added.task.payload.baseOid,
+    channel: 'review',
+    dependencies: [prerequisite.task.taskId],
+    description: 'Plan, build, review, and independently verify the change.',
+    executionMode: 'planner',
+    role: 'planner',
+    scope: ['src', 'test'],
+    teamAdapters: {
+      builder: 'claude',
+      researcher: 'codex',
+      test: 'claude',
+      reviewer: 'codex',
+      verifier: 'claude',
+    },
+    title: 'Ship the team slice',
+  });
+  assert.match(added.task.payload.baseOid, /^[a-f0-9]{40}$/);
+});
+
+test('team add uses the bounded default team adapter map and validates overrides', async () => {
+  const { repo, stateRoot } = createRepository();
+  await executeCli(['init', ...projectArgs(repo, stateRoot)]);
+
+  const added = await executeCli([
+    'team', 'add',
+    '--title', 'Use default team',
+    '--idempotency-key', 'team-defaults',
+    ...projectArgs(repo, stateRoot),
+  ]);
+  assert.deepEqual(added.task.payload.teamAdapters, {
+    builder: 'codex',
+    researcher: 'claude',
+    test: 'codex',
+    reviewer: 'claude',
+    verifier: 'codex',
+  });
+
+  await assert.rejects(
+    executeCli([
+      'team', 'add',
+      '--title', 'Invalid team',
+      '--builder-adapter', 'other',
+      '--idempotency-key', 'team-invalid-adapter',
+      ...projectArgs(repo, stateRoot),
+    ]),
+    { code: 'invalid_argument', message: '--builder-adapter must be one of codex|claude' },
+  );
+});
+
 test('CLI exposes fenced manual task and outbox operations', async () => {
   const { repo, stateRoot } = createRepository();
   await executeCli(['init', ...projectArgs(repo, stateRoot)]);
@@ -477,5 +561,7 @@ test('help does not advertise deferred scheduler flags', async () => {
   const help = await executeCli(['--help']);
   assert.doesNotMatch(help, /--priority|--max-attempts/);
   assert.match(help, /agent-team daemon/);
-  assert.equal(await executeCli(['--version']), '0.2.0-dev.0');
+  assert.match(help, /agent-team team add/);
+  assert.match(help, /--builder-adapter codex\|claude/);
+  assert.equal(await executeCli(['--version']), '0.2.0-dev.1');
 });

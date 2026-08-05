@@ -70,9 +70,15 @@ const elements = {
   reviewList: document.querySelector('#review-list'),
   reviewNavCount: document.querySelector('#review-nav-count'),
   taskBoard: document.querySelector('#task-board'),
+  taskAdapterLabel: document.querySelector('#task-adapter-label'),
   taskDialog: document.querySelector('#task-dialog'),
   taskForm: document.querySelector('#task-form'),
+  taskRoleField: document.querySelector('#task-role-field'),
   tasksEmpty: document.querySelector('#tasks-empty'),
+  teamForest: document.querySelector('#team-forest'),
+  teamMapCount: document.querySelector('#team-map-count'),
+  teamMapPanel: document.querySelector('#team-map-panel'),
+  teamRouting: document.querySelector('#team-routing'),
   themeLabel: document.querySelector('#theme-label'),
   themeToggle: document.querySelector('#theme-toggle'),
   toastRegion: document.querySelector('#toast-region'),
@@ -83,10 +89,25 @@ const elements = {
   workingTitle: document.querySelector('#working-title'),
 };
 
-const AGENTS = [
-  { adapter: 'codex', initials: 'CX', name: 'Codex CLI' },
-  { adapter: 'claude', initials: 'CL', name: 'Claude Code' },
+const DEFAULT_TEAM_ADAPTERS = Object.freeze({
+  builder: 'codex',
+  researcher: 'claude',
+  test: 'codex',
+  reviewer: 'claude',
+  verifier: 'codex',
+});
+const TEAM_ROSTER = [
+  { adapter: 'codex', initials: 'PL', name: 'Planner', role: 'planner' },
+  { adapter: 'codex', initials: 'BU', name: 'Builder', role: 'builder' },
+  { adapter: 'claude', initials: 'RS', name: 'Researcher', role: 'researcher' },
+  { adapter: 'codex', initials: 'TS', name: 'Test', role: 'test' },
+  { adapter: 'claude', initials: 'RV', name: 'Reviewer', role: 'reviewer' },
+  { adapter: 'codex', initials: 'VF', name: 'Verifier', role: 'verifier' },
 ];
+const ADAPTER_LABELS = {
+  claude: 'Claude Code',
+  codex: 'Codex CLI',
+};
 
 function createElement(tag, className, text) {
   const node = document.createElement(tag);
@@ -156,6 +177,7 @@ function titleForState(taskState) {
   return ({
     queued: '待执行',
     running: '运行中',
+    waiting_children: '等待子任务',
     completed: '已完成',
     failed: '失败',
   })[taskState] ?? taskState;
@@ -167,6 +189,28 @@ function taskTitle(task) {
 
 function adapterForTask(task) {
   return task?.payload?.adapter === 'claude' ? 'claude' : 'codex';
+}
+
+function roleForTask(task) {
+  return normalizeRole(task?.payload?.role ?? 'builder') || 'builder';
+}
+
+function parentTaskIdFor(task) {
+  return task?.parentTaskId ?? task?.payload?.parentTaskId ?? null;
+}
+
+function sliceKeyFor(task) {
+  return compactText(task?.sliceKey ?? task?.payload?.sliceKey, 100);
+}
+
+function rosterEntryForTask(task) {
+  const role = roleForTask(task);
+  return TEAM_ROSTER.find((entry) => entry.role === role) ?? {
+    adapter: adapterForTask(task),
+    initials: role.slice(0, 2).toUpperCase() || 'AG',
+    name: role || 'Agent',
+    role,
+  };
 }
 
 function loadoutIdentity(loadout) {
@@ -249,13 +293,15 @@ function agentProjection() {
   const tasks = state.snapshot?.tasks ?? [];
   const runs = state.snapshot?.runs ?? [];
 
-  return AGENTS.map((agent) => {
-    const agentTasks = tasks.filter((task) => adapterForTask(task) === agent.adapter);
-    const running = agentTasks.filter((task) => task.state === 'running');
+  return TEAM_ROSTER.map((agent) => {
+    const agentTasks = tasks.filter((task) => roleForTask(task) === agent.role);
+    const running = agentTasks.filter((task) => (
+      task.state === 'running' || task.state === 'waiting_children'
+    ));
     const queued = agentTasks.filter((task) => task.state === 'queued');
     const failed = agentTasks.filter((task) => task.state === 'failed');
     const activeRuns = runs.filter((run) => (
-      run.status === 'running' && adapterForTask(getTask(run.taskId)) === agent.adapter
+      run.status === 'running' && roleForTask(getTask(run.taskId)) === agent.role
     ));
     const current = running[0] ?? getTask(activeRuns[0]?.taskId) ?? queued[0] ?? failed[0] ?? null;
     const status = running.length > 0 || activeRuns.length > 0
@@ -275,6 +321,7 @@ function agentProjection() {
 
     return {
       ...agent,
+      adapter: current ? adapterForTask(current) : agent.adapter,
       current,
       failed: failed.length,
       headline,
@@ -296,8 +343,12 @@ function actorForEvent(event) {
   const task = eventTask(event);
   if (task) {
     const adapter = adapterForTask(task);
-    const agent = AGENTS.find((entry) => entry.adapter === adapter);
-    return { initials: agent?.initials ?? 'AG', name: event.payload?.worker ?? agent?.name ?? 'Agent', type: adapter };
+    const agent = rosterEntryForTask(task);
+    return {
+      initials: agent.initials,
+      name: event.payload?.worker ?? `${agent.name} · ${ADAPTER_LABELS[adapter]}`,
+      type: adapter,
+    };
   }
   if (event.entityType === 'channel' || event.kind === 'outbox.channel-configured' || event.kind === 'outbox.channel-updated') {
     return { initials: 'CP', name: 'Control plane', type: 'control' };
@@ -402,7 +453,9 @@ function renderMetrics() {
   const reviewCount = reviewMessages().length;
 
   elements.metricQueued.textContent = tasks.filter((task) => task.state === 'queued').length;
-  elements.metricRunning.textContent = tasks.filter((task) => task.state === 'running').length;
+  elements.metricRunning.textContent = tasks.filter((task) => (
+    task.state === 'running' || task.state === 'waiting_children'
+  )).length;
   elements.metricReview.textContent = reviewCount;
   elements.metricEvents.textContent = eventCount;
   elements.reviewNavCount.textContent = reviewCount;
@@ -441,11 +494,11 @@ function renderAgents() {
     const row = createElement('button', 'agent-row');
     row.type = 'button';
     row.dataset.status = agent.status;
-    row.setAttribute('aria-label', `${agent.name}：${agent.headline}`);
+    row.setAttribute('aria-label', `${agent.name}，${ADAPTER_LABELS[agent.adapter]}：${agent.headline}`);
     const copy = createElement('span', 'agent-row-copy');
     copy.append(
       createElement('strong', null, agent.name),
-      createElement('span', null, agent.headline),
+      createElement('span', null, `${ADAPTER_LABELS[agent.adapter]} · ${agent.headline}`),
     );
     const signal = createElement('span', 'agent-signal');
     signal.setAttribute('aria-hidden', 'true');
@@ -474,7 +527,7 @@ function renderAgents() {
       ? `${active[0].name} 正在工作`
       : `${active.length} 个 Agent 正在并行工作`;
     elements.workingDetail.textContent = active
-      .map((agent) => `${agent.name}: ${agent.headline}`)
+      .map((agent) => `${agent.name}/${agent.adapter}: ${agent.headline}`)
       .join(' · ');
   } else {
     const queued = agents.reduce((sum, agent) => sum + agent.queued, 0);
@@ -540,7 +593,9 @@ function taskMatchesFilter(task) {
   if (state.filter === 'attention') {
     return task.state === 'failed' || (task.state === 'queued' && !dependenciesReady(task));
   }
-  if (state.filter === 'active') return task.state === 'queued' || task.state === 'running';
+  if (state.filter === 'active') {
+    return ['queued', 'running', 'waiting_children'].includes(task.state);
+  }
   return true;
 }
 
@@ -555,7 +610,7 @@ function buildTaskCard(task) {
 
   const top = createElement('div', 'task-card-top');
   top.append(
-    createElement('span', null, shortId(task.taskId)),
+    createElement('span', null, sliceKeyFor(task) || shortId(task.taskId)),
     createElement('span', null, `g${task.generation}`),
   );
 
@@ -567,6 +622,14 @@ function buildTaskCard(task) {
     createElement('span', 'adapter-chip', payload.adapter ?? 'codex'),
     createElement('span', 'role-chip', payload.role ?? 'builder'),
   );
+  const status = createElement('span', 'status-chip', titleForState(task.state));
+  status.dataset.state = task.state;
+  meta.append(status);
+  if (parentTaskIdFor(task)) {
+    meta.append(createElement('span', 'lineage-chip', `parent ${shortId(parentTaskIdFor(task), 6)}`));
+  } else if (payload.executionMode === 'planner') {
+    meta.append(createElement('span', 'lineage-chip', 'team root'));
+  }
   if (task.state === 'queued' && !dependenciesReady(task)) {
     meta.append(createElement('span', 'status-chip', 'blocked'));
   }
@@ -593,12 +656,12 @@ function renderTaskBoard() {
   if (tasks.length === 0) return;
 
   for (const lane of [
-    { state: 'queued', label: '待执行' },
-    { state: 'running', label: '运行中' },
-    { state: 'completed', label: '已完成' },
-    { state: 'failed', label: '失败' },
+    { state: 'queued', states: ['queued'], label: '待执行' },
+    { state: 'running', states: ['running', 'waiting_children'], label: '运行中' },
+    { state: 'completed', states: ['completed'], label: '已完成' },
+    { state: 'failed', states: ['failed'], label: '失败' },
   ]) {
-    const laneTasks = tasks.filter((task) => task.state === lane.state);
+    const laneTasks = tasks.filter((task) => lane.states.includes(task.state));
     const column = createElement('section', 'task-lane');
     column.dataset.state = lane.state;
     column.setAttribute('aria-label', `${lane.label}任务`);
@@ -616,6 +679,105 @@ function renderTaskBoard() {
     }
     column.append(header, body);
     elements.taskBoard.append(column);
+  }
+}
+
+function dependencySummary(task, byId) {
+  const dependencies = task.dependencies ?? [];
+  if (dependencies.length === 0) return '无前置依赖';
+  const labels = dependencies.map((taskId) => {
+    const dependency = byId.get(taskId);
+    if (!dependency) return shortId(taskId, 6);
+    return sliceKeyFor(dependency) || roleForTask(dependency) || shortId(taskId, 6);
+  });
+  return `依赖 ${labels.join(' + ')}`;
+}
+
+function buildTeamNode(task, childrenByParent, byId, ancestry = new Set()) {
+  const branch = createElement('div', 'team-branch');
+  const node = createElement('button', 'team-node');
+  const children = childrenByParent.get(task.taskId) ?? [];
+  const role = roleForTask(task);
+  const adapter = adapterForTask(task);
+  const stateLabel = titleForState(task.state);
+  node.type = 'button';
+  node.dataset.state = task.state;
+  node.dataset.role = role;
+  node.classList.toggle('is-root', parentTaskIdFor(task) === null);
+  node.classList.toggle('is-selected', state.selectedTaskId === task.taskId);
+  node.setAttribute('aria-label', `${role}，${ADAPTER_LABELS[adapter]}，${stateLabel}：${taskTitle(task)}`);
+
+  const identity = createElement('div', 'team-node-identity');
+  const stateDot = createElement('span', 'team-node-state');
+  stateDot.setAttribute('aria-hidden', 'true');
+  identity.append(
+    stateDot,
+    createElement('strong', null, role),
+    createElement('span', 'team-node-adapter', adapter),
+    createElement('span', 'team-node-status', stateLabel),
+  );
+  const title = createElement('span', 'team-node-title', taskTitle(task));
+  const facts = createElement('span', 'team-node-facts');
+  facts.append(
+    createElement('span', null, sliceKeyFor(task) || `task ${shortId(task.taskId, 6)}`),
+    createElement('span', null, children.length > 0
+      ? `${children.length} 个直属子任务`
+      : dependencySummary(task, byId)),
+  );
+  node.append(identity, title, facts);
+  node.addEventListener('click', () => selectTask(task.taskId));
+  branch.append(node);
+
+  if (children.length > 0 && !ancestry.has(task.taskId)) {
+    const nextAncestry = new Set(ancestry);
+    nextAncestry.add(task.taskId);
+    const childList = createElement('div', 'team-children');
+    for (const child of children) {
+      if (!nextAncestry.has(child.taskId)) {
+        childList.append(buildTeamNode(child, childrenByParent, byId, nextAncestry));
+      }
+    }
+    branch.append(childList);
+  } else if (task.payload?.executionMode === 'planner' && children.length === 0) {
+    branch.append(createElement('div', 'team-children-empty', '等待 Planner 生成受限子任务图'));
+  }
+  return branch;
+}
+
+function renderTeamMap() {
+  const tasks = state.snapshot?.tasks ?? [];
+  const byId = new Map(tasks.map((task) => [task.taskId, task]));
+  const childrenByParent = new Map();
+  for (const task of tasks) {
+    const parentTaskId = parentTaskIdFor(task);
+    if (!parentTaskId) continue;
+    const children = childrenByParent.get(parentTaskId) ?? [];
+    children.push(task);
+    childrenByParent.set(parentTaskId, children);
+  }
+  for (const children of childrenByParent.values()) {
+    children.sort((left, right) => (
+      (left.createdAt ?? 0) - (right.createdAt ?? 0)
+      || left.taskId.localeCompare(right.taskId)
+    ));
+  }
+
+  const roots = tasks.filter((task) => {
+    const parentTaskId = parentTaskIdFor(task);
+    return (
+      (!parentTaskId && (task.payload?.executionMode === 'planner' || childrenByParent.has(task.taskId)))
+      || (parentTaskId && !byId.has(parentTaskId))
+    );
+  });
+  roots.sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
+
+  elements.teamForest.replaceChildren();
+  elements.teamMapPanel.hidden = roots.length === 0;
+  elements.teamMapCount.textContent = `${roots.length} team${roots.length === 1 ? '' : 's'}`;
+  for (const root of roots) {
+    const tree = createElement('article', 'team-tree');
+    tree.append(buildTeamNode(root, childrenByParent, byId));
+    elements.teamForest.append(tree);
   }
 }
 
@@ -679,17 +841,79 @@ function buildInspectorTabs() {
   return tabs;
 }
 
+function buildTaskReference(task, fallbackId) {
+  if (!task) {
+    return createElement('span', 'task-reference is-missing', shortId(fallbackId, 12));
+  }
+  const button = createElement('button', 'task-reference');
+  button.type = 'button';
+  const main = createElement('span', 'task-reference-main');
+  main.append(
+    createElement('strong', null, sliceKeyFor(task) || roleForTask(task)),
+    createElement('span', null, taskTitle(task)),
+  );
+  const stateLabel = createElement('span', 'task-reference-state', titleForState(task.state));
+  stateLabel.dataset.state = task.state;
+  button.append(main, stateLabel);
+  button.addEventListener('click', () => selectTask(task.taskId));
+  return button;
+}
+
+function buildLineageSummary(task) {
+  const tasks = state.snapshot?.tasks ?? [];
+  const parentTaskId = parentTaskIdFor(task);
+  const parent = parentTaskId ? getTask(parentTaskId) : null;
+  const children = tasks.filter((candidate) => parentTaskIdFor(candidate) === task.taskId);
+  if (!parentTaskId && children.length === 0 && !sliceKeyFor(task) && task.payload?.executionMode !== 'planner') {
+    return null;
+  }
+
+  const wrapper = createElement('div', 'lineage-summary');
+  if (parentTaskId) {
+    const parentRow = createElement('div', 'lineage-row');
+    parentRow.append(createElement('span', 'lineage-label', '父任务'), buildTaskReference(parent, parentTaskId));
+    wrapper.append(parentRow);
+  }
+  if (sliceKeyFor(task)) {
+    const sliceRow = createElement('div', 'lineage-row');
+    sliceRow.append(
+      createElement('span', 'lineage-label', 'Slice key'),
+      createElement('code', 'lineage-slice-key', sliceKeyFor(task)),
+    );
+    wrapper.append(sliceRow);
+  }
+
+  const childrenRow = createElement('div', 'lineage-row is-children');
+  childrenRow.append(createElement('span', 'lineage-label', '直属子任务'));
+  const childList = createElement('div', 'task-reference-list');
+  if (children.length === 0) {
+    childList.append(createElement(
+      'span',
+      'lineage-empty',
+      task.payload?.executionMode === 'planner' ? 'Planner 尚未生成子任务' : 'none',
+    ));
+  } else {
+    for (const child of children) childList.append(buildTaskReference(child, child.taskId));
+  }
+  childrenRow.append(childList);
+  wrapper.append(childrenRow);
+  return wrapper;
+}
+
 function buildInspectorSummary(task) {
   const payload = task.payload ?? {};
   const fragment = document.createDocumentFragment();
   const controlDetails = createElement('dl', 'detail-grid');
-  appendDetail(controlDetails, 'State', task.state);
+  appendDetail(controlDetails, 'State', titleForState(task.state));
   appendDetail(controlDetails, 'Generation', task.generation);
   appendDetail(controlDetails, 'Worker', task.worker);
   appendDetail(controlDetails, 'Lease expires', task.claimExpiresAt ? formatDate(task.claimExpiresAt) : 'not leased');
   appendDetail(controlDetails, 'Idempotency key', task.key);
   appendDetail(controlDetails, 'Channel', payload.channel ?? 'review');
   fragment.append(buildInspectorSection('控制面', controlDetails));
+
+  const lineage = buildLineageSummary(task);
+  if (lineage) fragment.append(buildInspectorSection('Agent lineage', lineage));
 
   const gitDetails = createElement('dl', 'detail-grid');
   appendDetail(gitDetails, 'Base OID', payload.baseOid ?? payload.base ?? 'HEAD');
@@ -777,7 +1001,8 @@ function renderInspector() {
   if (!task) return;
 
   const payload = task.payload ?? {};
-  const agent = AGENTS.find((entry) => entry.adapter === adapterForTask(task)) ?? AGENTS[0];
+  const agent = rosterEntryForTask(task);
+  const adapter = adapterForTask(task);
   const panel = createElement('div', 'inspector-panel');
   const header = createElement('header', 'inspector-header');
 
@@ -798,9 +1023,9 @@ function renderInspector() {
   const identityCopy = createElement('div');
   identityCopy.append(
     createElement('strong', null, task.worker ?? agent.name),
-    createElement('span', null, `${agent.name} · ${payload.role ?? 'builder'} · ${payload.channel ?? 'review'}`),
+    createElement('span', null, `${agent.name} · ${ADAPTER_LABELS[adapter]} · ${payload.channel ?? 'review'}`),
   );
-  identity.append(createAgentAvatar(agent), identityCopy);
+  identity.append(createAgentAvatar({ ...agent, adapter }), identityCopy);
   header.append(identity);
 
   const badges = createElement('div', 'task-card-meta');
@@ -809,6 +1034,10 @@ function renderInspector() {
     createElement('span', 'role-chip', payload.role ?? 'builder'),
     createElement('span', 'role-chip', `generation ${task.generation}`),
   );
+  if (sliceKeyFor(task)) badges.append(createElement('span', 'lineage-chip', sliceKeyFor(task)));
+  if (parentTaskIdFor(task)) {
+    badges.append(createElement('span', 'lineage-chip', `parent ${shortId(parentTaskIdFor(task), 6)}`));
+  }
   header.append(badges);
 
   const actions = createElement('div', 'inspector-actions');
@@ -1051,6 +1280,7 @@ function renderAll() {
   renderMetrics();
   renderAgents();
   renderActivity();
+  renderTeamMap();
   renderTaskBoard();
   renderInspector();
   renderChannels();
@@ -1063,6 +1293,7 @@ function renderAll() {
 function selectTask(taskId, inspectorMode = 'summary') {
   state.selectedTaskId = taskId;
   state.inspectorMode = inspectorMode;
+  renderTeamMap();
   renderTaskBoard();
   renderInspector();
 }
@@ -1070,6 +1301,7 @@ function selectTask(taskId, inspectorMode = 'summary') {
 function clearSelection() {
   state.selectedTaskId = null;
   state.inspectorMode = 'summary';
+  renderTeamMap();
   renderTaskBoard();
   renderInspector();
 }
@@ -1131,6 +1363,12 @@ function openTaskDialog() {
   elements.taskForm.elements.base.value = state.snapshot?.context?.branch ?? 'HEAD';
   elements.taskForm.elements.channel.value = 'review';
   elements.taskForm.elements.idempotencyKey.value = `gui-${crypto.randomUUID().slice(0, 12)}`;
+  elements.taskForm.elements.builderAdapter.value = DEFAULT_TEAM_ADAPTERS.builder;
+  elements.taskForm.elements.researcherAdapter.value = DEFAULT_TEAM_ADAPTERS.researcher;
+  elements.taskForm.elements.testAdapter.value = DEFAULT_TEAM_ADAPTERS.test;
+  elements.taskForm.elements.reviewerAdapter.value = DEFAULT_TEAM_ADAPTERS.reviewer;
+  elements.taskForm.elements.verifierAdapter.value = DEFAULT_TEAM_ADAPTERS.verifier;
+  syncTaskExecutionMode();
   elements.dialogError.hidden = true;
   elements.taskDialog.showModal();
   elements.taskForm.elements.title.focus();
@@ -1138,6 +1376,17 @@ function openTaskDialog() {
 
 function closeTaskDialog() {
   elements.taskDialog.close();
+}
+
+function syncTaskExecutionMode() {
+  const mode = elements.taskForm.elements.executionMode.value ?? 'single';
+  const teamMode = mode === 'team';
+  const role = elements.taskForm.elements.role;
+  elements.taskRoleField.hidden = teamMode;
+  elements.teamRouting.hidden = !teamMode;
+  role.disabled = teamMode;
+  elements.taskAdapterLabel.textContent = teamMode ? 'Planner Agent' : 'Agent';
+  elements.createTaskSubmit.textContent = teamMode ? '创建团队任务' : '写入队列';
 }
 
 async function submitTask(event) {
@@ -1148,19 +1397,30 @@ async function submitTask(event) {
   const dependencies = splitList(data.get('dependencies'));
   const scope = splitList(data.get('scope'));
   const key = String(data.get('idempotencyKey') ?? '').trim();
+  const teamMode = data.get('executionMode') === 'team';
   const payload = {
     adapter: String(data.get('adapter') ?? 'codex'),
     base: String(data.get('base') ?? 'HEAD').trim() || 'HEAD',
     channel: String(data.get('channel') ?? 'review').trim() || 'review',
     dependencies,
     description,
-    role: String(data.get('role') ?? 'builder'),
+    role: teamMode ? 'planner' : String(data.get('role') ?? 'builder'),
     scope,
     title,
   };
+  if (teamMode) {
+    payload.executionMode = 'planner';
+    payload.teamAdapters = {
+      builder: String(data.get('builderAdapter') ?? DEFAULT_TEAM_ADAPTERS.builder),
+      researcher: String(data.get('researcherAdapter') ?? DEFAULT_TEAM_ADAPTERS.researcher),
+      test: String(data.get('testAdapter') ?? DEFAULT_TEAM_ADAPTERS.test),
+      reviewer: String(data.get('reviewerAdapter') ?? DEFAULT_TEAM_ADAPTERS.reviewer),
+      verifier: String(data.get('verifierAdapter') ?? DEFAULT_TEAM_ADAPTERS.verifier),
+    };
+  }
 
   elements.createTaskSubmit.disabled = true;
-  elements.createTaskSubmit.textContent = '写入中';
+  elements.createTaskSubmit.textContent = teamMode ? '正在组建团队' : '写入中';
   elements.dialogError.hidden = true;
 
   try {
@@ -1169,7 +1429,11 @@ async function submitTask(event) {
       method: 'POST',
     });
     closeTaskDialog();
-    toast(result.status === 'replayed' ? '已安全重放现有任务' : '任务已写入队列');
+    toast(result.status === 'replayed'
+      ? '已安全重放现有任务'
+      : teamMode
+        ? '团队任务已交给 Planner'
+        : '任务已写入队列');
     state.selectedTaskId = result.task?.taskId ?? null;
     await refreshSnapshot({ quiet: true });
   } catch (error) {
@@ -1177,7 +1441,7 @@ async function submitTask(event) {
     elements.dialogError.hidden = false;
   } finally {
     elements.createTaskSubmit.disabled = false;
-    elements.createTaskSubmit.textContent = '写入队列';
+    syncTaskExecutionMode();
   }
 }
 
@@ -1218,6 +1482,9 @@ function bindEvents() {
   elements.closeTaskDialog.addEventListener('click', closeTaskDialog);
   document.querySelector('#cancel-task-dialog').addEventListener('click', closeTaskDialog);
   elements.taskForm.addEventListener('submit', submitTask);
+  for (const input of elements.taskForm.elements.executionMode) {
+    input.addEventListener('change', syncTaskExecutionMode);
+  }
   elements.themeToggle.addEventListener('click', cycleTheme);
   elements.workingBar.addEventListener('click', () => {
     setView('tasks');

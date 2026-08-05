@@ -3,6 +3,18 @@ import { renderRoleLoadout } from './project-assets.mjs';
 import { OutboxBackpressureError } from './project-store.mjs';
 import { buildTaskPrompt as defaultBuildPrompt } from './task-prompt.mjs';
 import {
+  aggregateTeamChildren,
+  assertRequiredVerificationChecks,
+  assertExecutionSnapshot,
+  buildTeamChildren,
+  buildTeamHandoff,
+  normalizeTeamReport,
+  parseTeamPlan,
+  parseTeamReview,
+  parseTeamVerification,
+  resolveExecutionMode,
+} from './team-workflow.mjs';
+import {
   createWorktree as defaultCreateWorktree,
   snapshotWorktree as defaultSnapshotWorktree,
 } from './worktree.mjs';
@@ -43,11 +55,12 @@ function selectAdapterName(explicitAdapter, payload = {}) {
 function buildCompletionResult({
   adapterName,
   claim,
+  executionMode,
   runResult,
   snapshot,
   worktree,
 }) {
-  return {
+  const result = {
     adapter: adapterName,
     baseOid: worktree.baseOid,
     branchName: worktree.branchName,
@@ -58,6 +71,28 @@ function buildCompletionResult({
     taskId: claim.taskId,
     worktreePath: worktree.worktreePath,
   };
+
+  if (executionMode === 'standalone') {
+    return result;
+  }
+
+  result.executionMode = executionMode;
+  result.role = claim.payload?.role ?? null;
+  if (executionMode === 'planner') {
+    result.finalMessage = null;
+    result.plan = parseTeamPlan(runResult.finalMessage);
+  } else if (executionMode === 'report') {
+    result.finalMessage = normalizeTeamReport(runResult.finalMessage);
+  } else if (executionMode === 'review') {
+    result.review = parseTeamReview(runResult.finalMessage);
+  } else if (executionMode === 'verify') {
+    result.verification = assertRequiredVerificationChecks(
+      parseTeamVerification(runResult.finalMessage),
+      claim.payload?.requiredChecks,
+    );
+  }
+
+  return result;
 }
 
 function buildReviewPayload({
@@ -147,6 +182,84 @@ function resolveReviewChannel(options, payload) {
 
 function resolveReviewCapacity(options, payload) {
   return options.reviewChannelCapacity ?? payload.reviewChannelCapacity ?? payload.channelCapacity;
+}
+
+function requireExactCandidateOid(name, value) {
+  requireString(name, value);
+  if (!/^[0-9a-f]{40,64}$/u.test(value)) {
+    throw new TypeError(`${name} must be an exact hexadecimal commit OID`);
+  }
+  return value;
+}
+
+function resolveRequestedRef(store, claim, payload) {
+  if (payload.baseFromTaskId === undefined) {
+    return payload.baseOid ?? payload.base ?? payload.ref ?? 'HEAD';
+  }
+
+  requireString('payload.baseFromTaskId', payload.baseFromTaskId);
+  if (!claim.parentTaskId) {
+    throw new Error('payload.baseFromTaskId requires a parent team task');
+  }
+  if (typeof store.getTask !== 'function') {
+    throw new TypeError('store.getTask is required for payload.baseFromTaskId');
+  }
+  const source = store.getTask(payload.baseFromTaskId);
+  if (!source || source.state !== 'completed') {
+    throw new Error(`base source task "${payload.baseFromTaskId}" must be completed`);
+  }
+  if (source.parentTaskId !== claim.parentTaskId) {
+    throw new Error(`base source task "${payload.baseFromTaskId}" belongs to another parent`);
+  }
+  return requireExactCandidateOid(
+    `task ${payload.baseFromTaskId} candidateOid`,
+    source.result?.candidateOid,
+  );
+}
+
+function resolveHandoff(store, claim, payload) {
+  const taskIds = payload.handoffTaskIds ?? [];
+  if (!Array.isArray(taskIds)) {
+    throw new TypeError('payload.handoffTaskIds must be an array');
+  }
+  if (taskIds.length > 8) {
+    throw new TypeError('payload.handoffTaskIds must contain at most 8 task ids');
+  }
+  for (const taskId of taskIds) requireString('payload.handoffTaskId', taskId);
+  if (new Set(taskIds).size !== taskIds.length) {
+    throw new TypeError('payload.handoffTaskIds must be unique');
+  }
+  if (taskIds.length === 0) return null;
+  if (!claim.parentTaskId) {
+    throw new Error('payload.handoffTaskIds requires a parent team task');
+  }
+  if (typeof store.getTask !== 'function') {
+    throw new TypeError('store.getTask is required for payload.handoffTaskIds');
+  }
+
+  const tasks = taskIds.map((taskId) => {
+    const task = store.getTask(taskId);
+    if (!task) throw new Error(`handoff task "${taskId}" does not exist`);
+    if (task.parentTaskId !== claim.parentTaskId) {
+      throw new Error(`handoff task "${taskId}" belongs to another parent`);
+    }
+    return task;
+  });
+  return buildTeamHandoff(tasks);
+}
+
+function buildTeamReviewPayload({ claim, result, worker }) {
+  return {
+    schema: 'team.delivery.v1',
+    taskId: claim.taskId,
+    generation: claim.generation,
+    worker,
+    candidateOid: result.candidateOid,
+    verdict: result.verdict,
+    childTaskIds: result.childTaskIds,
+    reviewVerdict: result.review.verdict,
+    verificationVerdict: result.verification.verdict,
+  };
 }
 
 function resolveAdapterRunOptions(options, adapterName, prompt, signal, worktreePath) {
@@ -245,6 +358,114 @@ function assertSnapshot(snapshot) {
   requireString('snapshot.candidateOid', snapshot.candidateOid);
 }
 
+function requeueAfterBackpressure({ claim, error, options, store, extra = {} }) {
+  const requeued = store.requeueTaskLease({
+    availableAt: options.backpressureAvailableAt,
+    claimToken: claim.claimToken,
+    generation: claim.generation,
+    taskId: claim.taskId,
+    worker: claim.worker,
+  });
+
+  if (!requeued) {
+    return {
+      claim,
+      error,
+      ...extra,
+      status: 'lost-lease',
+    };
+  }
+
+  return {
+    claim,
+    error,
+    ...extra,
+    status: 'backpressure',
+    task: requeued,
+  };
+}
+
+function aggregatePlannerClaim({ claim, heartbeat, options, payload, store }) {
+  if (typeof store.listTaskChildren !== 'function') {
+    throw new TypeError('store.listTaskChildren is required to aggregate a team');
+  }
+
+  if (heartbeat.lost) {
+    return { claim, status: 'lost-lease', worktree: null };
+  }
+
+  const children = store.listTaskChildren(claim.taskId);
+  const aggregate = aggregateTeamChildren({ parentTask: claim, children });
+
+  if (!aggregate.ok) {
+    const failedTask = store.failTask({
+      claimToken: claim.claimToken,
+      error: aggregate.error,
+      generation: claim.generation,
+      preserveResult: true,
+      taskId: claim.taskId,
+      worker: claim.worker,
+    });
+    if (!failedTask) {
+      return {
+        claim,
+        error: aggregate.error,
+        status: 'lost-lease',
+        worktree: null,
+      };
+    }
+    return {
+      claim,
+      error: aggregate.error,
+      status: 'failed',
+      task: failedTask,
+      worktree: null,
+    };
+  }
+
+  let completed;
+  try {
+    completed = store.completeTask({
+      claimToken: claim.claimToken,
+      generation: claim.generation,
+      outbox: {
+        capacity: resolveReviewCapacity(options, payload),
+        channel: resolveReviewChannel(options, payload),
+        messageId: `team:${claim.taskId}:g${claim.generation}`,
+        payload: buildTeamReviewPayload({
+          claim,
+          result: aggregate.result,
+          worker: claim.worker,
+        }),
+      },
+      result: aggregate.result,
+      taskId: claim.taskId,
+      worker: claim.worker,
+    });
+  } catch (error) {
+    if (!(error instanceof OutboxBackpressureError)) throw error;
+    return requeueAfterBackpressure({
+      claim,
+      error,
+      options,
+      store,
+      extra: { worktree: null },
+    });
+  }
+
+  if (!completed) {
+    return { claim, status: 'lost-lease', worktree: null };
+  }
+
+  return {
+    claim,
+    outbox: completed.outbox,
+    status: 'completed',
+    task: completed.task,
+    worktree: null,
+  };
+}
+
 export async function runWorkerOnce(options = {}) {
   requireObject('options', options);
   requireObject('options.store', options.store);
@@ -283,6 +504,11 @@ export async function runWorkerOnce(options = {}) {
   let worktree = null;
 
   try {
+    const executionMode = resolveExecutionMode(payload);
+    if (executionMode === 'planner' && claim.result?.plan) {
+      return aggregatePlannerClaim({ claim, heartbeat, options, payload, store });
+    }
+
     const roleReference = resolveRoleReference(store, payload, options.maxLoadoutBytes);
     if (roleReference) {
       const recordedLoadout = store.appendTaskEvent({
@@ -303,7 +529,8 @@ export async function runWorkerOnce(options = {}) {
       }
     }
 
-    const requestedRef = payload.baseOid ?? payload.base ?? payload.ref ?? 'HEAD';
+    const requestedRef = resolveRequestedRef(store, claim, payload);
+    const handoff = resolveHandoff(store, claim, payload);
     const adapterName = selectAdapterName(options.adapter, payload);
     const runAdapter = adapters[adapterName];
     if (typeof runAdapter !== 'function') {
@@ -347,6 +574,7 @@ export async function runWorkerOnce(options = {}) {
       baseOid: worktree.baseOid,
       branchName: worktree.branchName,
       repoRoot: worktree.worktreePath,
+      handoff,
       roleReference,
       worktreePath: worktree.worktreePath,
     });
@@ -435,6 +663,9 @@ export async function runWorkerOnce(options = {}) {
 
     const snapshot = await snapshotWorktree({ worktreePath: worktree.worktreePath });
     assertSnapshot(snapshot);
+    if (executionMode !== 'standalone') {
+      assertExecutionSnapshot(executionMode, snapshot, worktree.baseOid);
+    }
 
     if (heartbeat.lost) {
       return {
@@ -449,28 +680,71 @@ export async function runWorkerOnce(options = {}) {
     const completionResult = buildCompletionResult({
       adapterName,
       claim,
+      executionMode,
       runResult,
       snapshot,
       worktree,
     });
+
+    if (executionMode === 'planner') {
+      if (typeof store.fanOutTask !== 'function') {
+        throw new TypeError('store.fanOutTask is required for planner execution');
+      }
+      const children = buildTeamChildren({
+        baseOid: worktree.baseOid,
+        ...(options.generateTaskId ? { generateTaskId: options.generateTaskId } : {}),
+        parentTask: claim,
+        plan: completionResult.plan,
+      });
+      const fanOut = store.fanOutTask({
+        children,
+        claimToken: claim.claimToken,
+        generation: claim.generation,
+        result: completionResult,
+        taskId: claim.taskId,
+        worker: claim.worker,
+      });
+      if (!fanOut) {
+        return {
+          claim,
+          run: runResult,
+          snapshot,
+          status: 'lost-lease',
+          worktree,
+        };
+      }
+      return {
+        children: fanOut.children,
+        claim,
+        run: runResult,
+        snapshot,
+        status: 'waiting-children',
+        task: fanOut.parent,
+        worktree,
+      };
+    }
+
+    const completionOutbox = executionMode === 'standalone'
+      ? {
+        capacity: resolveReviewCapacity(options, payload),
+        channel: resolveReviewChannel(options, payload),
+        messageId: `candidate:${claim.taskId}:g${claim.generation}`,
+        payload: buildReviewPayload({
+          adapterName,
+          claim,
+          runResult,
+          snapshot,
+          worker,
+          worktree,
+        }),
+      }
+      : null;
     let completed;
     try {
       completed = store.completeTask({
         claimToken: claim.claimToken,
         generation: claim.generation,
-        outbox: {
-          capacity: resolveReviewCapacity(options, payload),
-          channel: resolveReviewChannel(options, payload),
-          messageId: `candidate:${claim.taskId}:g${claim.generation}`,
-          payload: buildReviewPayload({
-            adapterName,
-            claim,
-            runResult,
-            snapshot,
-            worker,
-            worktree,
-          }),
-        },
+        ...(completionOutbox ? { outbox: completionOutbox } : {}),
         result: completionResult,
         taskId: claim.taskId,
         worker: claim.worker,
@@ -479,35 +753,13 @@ export async function runWorkerOnce(options = {}) {
       if (!(error instanceof OutboxBackpressureError)) {
         throw error;
       }
-
-      const requeued = store.requeueTaskLease({
-        availableAt: options.backpressureAvailableAt,
-        claimToken: claim.claimToken,
-        generation: claim.generation,
-        taskId: claim.taskId,
-        worker: claim.worker,
-      });
-
-      if (!requeued) {
-        return {
-          claim,
-          error,
-          run: runResult,
-          snapshot,
-          status: 'lost-lease',
-          worktree,
-        };
-      }
-
-      return {
+      return requeueAfterBackpressure({
         claim,
         error,
-        run: runResult,
-        snapshot,
-        status: 'backpressure',
-        task: requeued,
-        worktree,
-      };
+        options,
+        store,
+        extra: { run: runResult, snapshot, worktree },
+      });
     }
 
     if (!completed) {
@@ -522,11 +774,11 @@ export async function runWorkerOnce(options = {}) {
 
     return {
       claim,
-      outbox: completed.outbox,
+      ...(completionOutbox ? { outbox: completed.outbox } : {}),
       run: runResult,
       snapshot,
       status: 'completed',
-      task: completed.task,
+      task: completionOutbox ? completed.task : (completed.task ?? completed),
       worktree,
     };
   } catch (error) {
