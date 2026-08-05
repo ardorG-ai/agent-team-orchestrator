@@ -1363,6 +1363,65 @@ test('runWorkerOnce rejects root-level dynamic base and handoff references befor
   }
 });
 
+test('runWorkerOnce constrains Claude researcher tools without blocking test checks', async () => {
+  const cases = [
+    { role: 'researcher', expectedTools: ['Read', 'Grep', 'Glob'] },
+    { role: 'test', expectedTools: undefined },
+  ];
+
+  for (const entry of cases) {
+    const worktreePath = await makeWorktreeRoot(`team-${entry.role}-tools`);
+    const claim = makeTeamClaim({
+      key: `team/root::${entry.role}-tools`,
+      parentTaskId: 'team-parent',
+      payload: {
+        adapter: 'claude',
+        executionMode: 'report',
+        role: entry.role,
+        title: `${entry.role} with bounded context`,
+      },
+      sliceKey: entry.role,
+      taskId: `team-${entry.role}-tools`,
+    });
+    const store = makeTeamStore({ claim });
+    let deliveredTools = null;
+
+    try {
+      const result = await runWorkerOnce({
+        adapters: {
+          claude: async (adapterOptions) => {
+            deliveredTools = adapterOptions.tools;
+            return {
+              finalMessage: 'Bounded report.',
+              ok: true,
+              terminal: { status: 'success' },
+            };
+          },
+        },
+        buildPrompt: () => 'prompt',
+        context: { repoRoot: worktreePath, worktreeRoot: path.dirname(worktreePath) },
+        createWorktree: async () => ({
+          baseOid: 'a'.repeat(40),
+          branchName: `team-${entry.role}-tools-g1`,
+          worktreePath,
+        }),
+        snapshotWorktree: async () => ({
+          candidateOid: 'a'.repeat(40),
+          clean: true,
+          worktreePath,
+        }),
+        store,
+        worker: claim.worker,
+      });
+
+      assert.equal(result.status, 'completed');
+      assert.deepEqual(deliveredTools, entry.expectedTools);
+    } finally {
+      await fs.rm(worktreePath, { force: true, recursive: true });
+    }
+  }
+});
+
 test('runWorkerOnce fails closed when a read-only team role changes HEAD', async () => {
   const worktreePath = await makeWorktreeRoot('team-readonly-change');
   const claim = makeTeamClaim({

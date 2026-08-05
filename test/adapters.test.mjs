@@ -143,6 +143,24 @@ test('runClaude uses isolated print argv without disabling built-in tools', asyn
   ]);
 });
 
+test('runClaude serializes an explicit built-in tool allowlist', async () => {
+  const result = await runClaude({
+    cwd: path.dirname(fixturePath),
+    env: {
+      AGENT_SCENARIO: 'success',
+    },
+    envAllowlist: fakeEnvAllowlist,
+    executable: process.execPath,
+    launcherArgs: [fixturePath],
+    prompt: 'research safely',
+    timeoutMs: 2_000,
+    tools: ['Read', 'Grep', 'Glob', 'Read'],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.args.slice(-2), ['--tools', 'Read,Grep,Glob']);
+});
+
 test('runSubprocess enforces timeout', async () => {
   const result = await runSubprocess({
     command: process.execPath,

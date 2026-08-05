@@ -336,7 +336,7 @@ async function runAdapter(adapter, options, buildArgs, providerEnvAllowlist) {
   }
 
   const subprocessResult = await runSubprocess({
-    args: [...launcherArgs, ...buildArgs(cwd)],
+    args: [...launcherArgs, ...buildArgs(cwd, options)],
     command: executable,
     cwd,
     env,
@@ -360,16 +360,29 @@ export async function runClaude(options) {
   return runAdapter(
     'claude',
     options,
-    () => [
-      '-p',
-      '--safe-mode',
-      '--no-session-persistence',
-      '--verbose',
-      '--output-format',
-      'stream-json',
-      '--permission-mode',
-      'acceptEdits',
-    ],
+    (_cwd, adapterOptions = {}) => {
+      const args = [
+        '-p',
+        '--safe-mode',
+        '--no-session-persistence',
+        '--verbose',
+        '--output-format',
+        'stream-json',
+        '--permission-mode',
+        'acceptEdits',
+      ];
+      if (adapterOptions.tools !== undefined) {
+        if (
+          !Array.isArray(adapterOptions.tools)
+          || adapterOptions.tools.length === 0
+          || adapterOptions.tools.some((tool) => typeof tool !== 'string' || tool.trim() === '')
+        ) {
+          throw new TypeError('claude adapter tools must be a non-empty array of strings');
+        }
+        args.push('--tools', [...new Set(adapterOptions.tools.map((tool) => tool.trim()))].join(','));
+      }
+      return args;
+    },
     CLAUDE_ENV_ALLOWLIST,
   );
 }

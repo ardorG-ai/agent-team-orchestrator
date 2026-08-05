@@ -312,7 +312,15 @@ function buildTeamReviewPayload({ claim, result, worker }) {
   };
 }
 
-function resolveAdapterRunOptions(options, adapterName, prompt, signal, worktreePath) {
+function resolveAdapterRunOptions(
+  options,
+  adapterName,
+  executionMode,
+  role,
+  prompt,
+  signal,
+  worktreePath,
+) {
   const adapterOptions = options.adapterOptions ?? {};
   const {
     claude: _claudeScoped,
@@ -337,11 +345,19 @@ function resolveAdapterRunOptions(options, adapterName, prompt, signal, worktree
     'maxStderrBytes',
     'maxStdoutBytes',
     'timeoutMs',
+    'tools',
   ]) {
     if (options[key] !== undefined) explicit[key] = options[key];
   }
 
+  const roleDefaults = adapterName === 'claude'
+    && executionMode === 'report'
+    && role === 'researcher'
+    ? { tools: ['Read', 'Grep', 'Glob'] }
+    : {};
+
   return {
+    ...roleDefaults,
     ...shared,
     ...scoped,
     ...explicit,
@@ -706,6 +722,8 @@ export async function runWorkerOnce(options = {}) {
         resolveAdapterRunOptions(
           options,
           adapterName,
+          executionMode,
+          payload.role,
           prompt,
           adapterAbort.signal,
           worktree.worktreePath,

@@ -78,6 +78,39 @@ test('buildTaskPrompt gives planner and read-only roles strict non-editing contr
   assert.doesNotMatch(reviewerPrompt, /Commit the finished change/);
 });
 
+test('buildTaskPrompt gives report roles a bounded investigation budget', () => {
+  const prompt = buildTaskPrompt({
+    payload: {
+      executionMode: 'report',
+      requiredChecks: ['node --test test/team-workflow.test.mjs'],
+      role: 'researcher',
+      title: 'Confirm the workflow contract',
+    },
+    taskId: 'research-1',
+  }, { generation: 3 });
+
+  assert.match(prompt, /at most 12 repository-inspection tool calls/i);
+  assert.match(prompt, /at most 200 lines/i);
+  assert.match(prompt, /required checks as downstream context/i);
+  assert.match(prompt, /Do not spawn subagents/i);
+  assert.match(prompt, /exhaustive repository reading is a failure mode/i);
+  assert.match(prompt, /strictly read-only/i);
+
+  const testPrompt = buildTaskPrompt({
+    payload: {
+      executionMode: 'report',
+      requiredChecks: ['node --test test/team-workflow.test.mjs'],
+      role: 'test',
+      title: 'Run the workflow checks',
+    },
+    taskId: 'test-1',
+  }, { generation: 3 });
+
+  assert.match(testPrompt, /strictly read-only/i);
+  assert.doesNotMatch(testPrompt, /required checks as downstream context/i);
+  assert.doesNotMatch(testPrompt, /at most 12 repository-inspection tool calls/i);
+});
+
 test('buildTaskPrompt keeps Git metadata controller-owned for standalone and build modes', () => {
   const standalone = buildTaskPrompt({
     payload: { title: 'Standalone change' },

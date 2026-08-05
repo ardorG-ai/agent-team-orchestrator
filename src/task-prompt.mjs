@@ -12,7 +12,7 @@ function listSection(title, values) {
   )).join('\n'));
 }
 
-function modeRequirements(executionMode) {
+function modeRequirements(executionMode, role) {
   const common = [
     '- Work only inside this Git worktree and the allowed scope.',
     '- Do not merge, rebase, force-update refs, delete branches, or delete worktrees.',
@@ -41,10 +41,23 @@ function modeRequirements(executionMode) {
     ].join('\n');
   }
 
-  return [
+  const readOnlyRequirements = [
     ...common,
     '- Do not edit tracked or untracked files and do not create commits. This role is strictly read-only.',
-  ].join('\n');
+    '- Start with a targeted search or candidate diff, then read only the matching ranges needed for evidence.',
+    '- Keep every tool result bounded. Do not dump whole large files, repository-wide logs, dependency trees, generated artifacts, lockfiles, databases, or full verbose test output into the context.',
+  ];
+
+  if (executionMode === 'report' && role === 'researcher') {
+    return [
+      ...readOnlyRequirements,
+      '- Treat listed required checks as downstream context. Do not execute them unless the assigned objective explicitly asks you to run them.',
+      '- Do not spawn subagents for this bounded report; the controller already owns team fan-out.',
+      '- Use at most 12 repository-inspection tool calls and at most 200 lines from any one file or command. Stop once the report has enough source-backed evidence; exhaustive repository reading is a failure mode.',
+    ].join('\n');
+  }
+
+  return readOnlyRequirements.join('\n');
 }
 
 function finalResponseContract(executionMode) {
@@ -131,7 +144,7 @@ ${scope}
 ${dependencies}
 
 ## Required behavior
-${modeRequirements(executionMode)}
+${modeRequirements(executionMode, payload.role)}
 ${roleReferenceSection}${handoffSection}
 
 ## Final response
