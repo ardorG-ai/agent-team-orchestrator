@@ -1,0 +1,19 @@
+{
+  "name": "agent-team-orchestrator",
+  "version": "0.1.0",
+  "description": "Local-first, fenced multi-agent orchestration for Codex CLI and Claude Code.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "agent-team": "./bin/agent-team.mjs"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.mjs",
+    "test:stress": "node --disable-warning=ExperimentalWarning --test test/stress/*.test.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "license": "MIT"
+}
