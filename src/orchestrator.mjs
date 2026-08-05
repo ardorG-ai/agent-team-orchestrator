@@ -351,6 +351,43 @@ function resolveAdapterRunOptions(options, adapterName, prompt, signal, worktree
   };
 }
 
+function createAbortBridgeSignal(signals) {
+  const controller = new AbortController();
+  const cleanups = [];
+
+  const abort = () => {
+    if (controller.signal.aborted) {
+      return;
+    }
+    controller.abort();
+    while (cleanups.length > 0) {
+      cleanups.pop()?.();
+    }
+  };
+
+  for (const signal of signals) {
+    if (!(signal instanceof AbortSignal)) {
+      continue;
+    }
+    if (signal.aborted) {
+      abort();
+      break;
+    }
+    const onAbort = () => abort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    cleanups.push(() => signal.removeEventListener('abort', onAbort));
+  }
+
+  return {
+    signal: controller.signal,
+    stop() {
+      while (cleanups.length > 0) {
+        cleanups.pop()?.();
+      }
+    },
+  };
+}
+
 function startHeartbeat({ claim, leaseMs, store }) {
   const intervalMs = Math.max(1, Math.floor(leaseMs / 3));
   const controller = new AbortController();
@@ -397,6 +434,29 @@ function startHeartbeat({ claim, leaseMs, store }) {
     stop() {
       clearInterval(timer);
     },
+  };
+}
+
+function interruptClaim({ claim, options, store }) {
+  const requeued = store.requeueTaskLease({
+    availableAt: options.interruptAvailableAt,
+    claimToken: claim.claimToken,
+    generation: claim.generation,
+    taskId: claim.taskId,
+    worker: claim.worker,
+  });
+
+  if (!requeued) {
+    return {
+      claim,
+      status: 'lost-lease',
+    };
+  }
+
+  return {
+    claim,
+    status: 'interrupted',
+    task: requeued,
   };
 }
 
@@ -544,14 +604,24 @@ export async function runWorkerOnce(options = {}) {
     ...(options.adapters ?? {}),
   };
 
-  store.requeueExpiredTasks();
+  const activeClaimTokens = options.activeClaimTokens instanceof Set ? options.activeClaimTokens : null;
+  const externalSignal = options.signal;
+  if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal)) {
+    throw new TypeError('options.signal must be an AbortSignal');
+  }
+
+  store.requeueExpiredTasks({
+    ...(activeClaimTokens ? { excludeClaimTokens: [...activeClaimTokens] } : {}),
+  });
   const claim = store.claimTask({ taskId, ttlMs: leaseMs, worker });
   if (!claim) {
     return { status: 'idle' };
   }
+  activeClaimTokens?.add(claim.claimToken);
 
   const payload = claim.payload ?? {};
   const heartbeat = startHeartbeat({ claim, leaseMs, store });
+  const adapterAbort = createAbortBridgeSignal([heartbeat.signal, externalSignal]);
   let worktree = null;
 
   try {
@@ -637,13 +707,13 @@ export async function runWorkerOnce(options = {}) {
           options,
           adapterName,
           prompt,
-          heartbeat.signal,
+          adapterAbort.signal,
           worktree.worktreePath,
         ),
       );
     } catch (error) {
       runResult = {
-        aborted: heartbeat.signal.aborted,
+        aborted: adapterAbort.signal.aborted,
         diagnostics: [],
         exitCode: null,
         finalMessage: error instanceof Error ? error.message : String(error),
@@ -681,6 +751,14 @@ export async function runWorkerOnce(options = {}) {
         claim,
         run: runResult,
         status: 'lost-lease',
+        worktree,
+      };
+    }
+
+    if (externalSignal?.aborted) {
+      return {
+        ...interruptClaim({ claim, options, store }),
+        run: runResult,
         worktree,
       };
     }
@@ -902,7 +980,9 @@ export async function runWorkerOnce(options = {}) {
       worktree,
     };
   } finally {
+    adapterAbort.stop();
     heartbeat.stop();
+    activeClaimTokens?.delete(claim.claimToken);
   }
 }
 

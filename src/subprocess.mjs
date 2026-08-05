@@ -64,32 +64,118 @@ export function buildAllowedEnv(overrides = {}, allowlist = DEFAULT_ENV_ALLOWLIS
   return env;
 }
 
-function killProcessTree(child, signal, graceMs) {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) {
-    return;
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function hasPosixProcessGroup(groupId) {
+  if (!groupId || process.platform === 'win32') {
+    return false;
   }
 
   try {
-    if (process.platform === 'win32') child.kill(signal);
-    else process.kill(-child.pid, signal);
-  } catch {
-    return;
-  }
-
-  if (graceMs <= 0) {
-    return;
-  }
-
-  setTimeout(() => {
-    if (child.exitCode === null && child.signalCode === null) {
-      try {
-        if (process.platform === 'win32') child.kill('SIGKILL');
-        else process.kill(-child.pid, 'SIGKILL');
-      } catch {
-        // Ignore late kill failures.
-      }
+    process.kill(-groupId, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') {
+      return false;
     }
-  }, graceMs).unref?.();
+    return true;
+  }
+}
+
+function sendPosixGroupSignal(groupId, signal) {
+  if (!groupId) {
+    return false;
+  }
+
+  try {
+    process.kill(-groupId, signal);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') {
+      return false;
+    }
+    return true;
+  }
+}
+
+async function waitForPosixProcessGroupExit(groupId, timeoutMs) {
+  const deadline = Date.now() + Math.max(timeoutMs, 0);
+  while (hasPosixProcessGroup(groupId)) {
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await delay(10);
+  }
+  return true;
+}
+
+function resolveTaskkillExecutable() {
+  if (process.env.SYSTEMROOT) {
+    return path.join(process.env.SYSTEMROOT, 'System32', 'taskkill.exe');
+  }
+
+  return 'taskkill';
+}
+
+async function runTaskkill(pid, force = false) {
+  if (!pid || process.platform !== 'win32') {
+    return false;
+  }
+
+  const args = ['/PID', String(pid), '/T'];
+  if (force) {
+    args.push('/F');
+  }
+
+  return await new Promise((resolve) => {
+    const child = spawn(resolveTaskkillExecutable(), args, {
+      shell: false,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+
+    child.once('error', () => resolve(false));
+    child.once('close', (code) => resolve(code === 0));
+  });
+}
+
+async function terminateProcessTree(child, signal, graceMs) {
+  if (!child.pid) {
+    return;
+  }
+
+  if (process.platform === 'win32') {
+    const firstPass = await runTaskkill(child.pid, false);
+    if (graceMs > 0 && firstPass) {
+      await delay(graceMs);
+    }
+    await runTaskkill(child.pid, true);
+    return;
+  }
+
+  const groupId = child.pid;
+  if (!hasPosixProcessGroup(groupId)) {
+    return;
+  }
+
+  sendPosixGroupSignal(groupId, signal);
+  if (graceMs <= 0 || signal === 'SIGKILL') {
+    sendPosixGroupSignal(groupId, 'SIGKILL');
+    await waitForPosixProcessGroupExit(groupId, 250);
+    return;
+  }
+
+  const exitedDuringGrace = await waitForPosixProcessGroupExit(groupId, graceMs);
+  if (exitedDuringGrace) {
+    return;
+  }
+
+  sendPosixGroupSignal(groupId, 'SIGKILL');
+  await waitForPosixProcessGroupExit(groupId, 250);
 }
 
 export function resolveExecutable(command, env = process.env) {
@@ -151,6 +237,7 @@ export async function runSubprocess(options) {
   let spawnError = null;
   let stdinError = null;
   let settled = false;
+  let treeTerminationPromise = null;
   const inputBuffer = Buffer.isBuffer(input)
     ? input
     : Buffer.from(input === null || input === undefined ? '' : String(input));
@@ -167,9 +254,16 @@ export async function runSubprocess(options) {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
+  const ensureProcessTreeTerminated = () => {
+    if (!treeTerminationPromise) {
+      treeTerminationPromise = terminateProcessTree(child, killSignal, killGraceMs);
+    }
+    return treeTerminationPromise;
+  };
+
   const abortHandler = () => {
     aborted = true;
-    killProcessTree(child, killSignal, killGraceMs);
+    void ensureProcessTreeTerminated();
   };
 
   if (signal?.aborted) {
@@ -184,7 +278,7 @@ export async function runSubprocess(options) {
           return;
         }
         timedOut = true;
-        killProcessTree(child, killSignal, killGraceMs);
+        void ensureProcessTreeTerminated();
       }, timeoutMs)
     : null;
 
@@ -196,14 +290,14 @@ export async function runSubprocess(options) {
     child.stdout.on('data', (chunk) => {
       if (!outputLimit && appendWithinCap(stdoutState, chunk, maxStdoutBytes)) {
         outputLimit = 'stdout';
-        killProcessTree(child, killSignal, killGraceMs);
+        void ensureProcessTreeTerminated();
       }
     });
 
     child.stderr.on('data', (chunk) => {
       if (!outputLimit && appendWithinCap(stderrState, chunk, maxStderrBytes)) {
         outputLimit = 'stderr';
-        killProcessTree(child, killSignal, killGraceMs);
+        void ensureProcessTreeTerminated();
       }
     });
 
@@ -231,6 +325,21 @@ export async function runSubprocess(options) {
       signal.removeEventListener('abort', abortHandler);
     }
   });
+
+  if (
+    process.platform !== 'win32'
+    && !aborted
+    && !timedOut
+    && !outputLimit
+    && !treeTerminationPromise
+    && hasPosixProcessGroup(child.pid)
+  ) {
+    treeTerminationPromise = terminateProcessTree(child, killSignal, killGraceMs);
+  }
+
+  if (treeTerminationPromise) {
+    await treeTerminationPromise;
+  }
 
   if (spawnError && result.exitCode === null && result.signal === null) {
     throw spawnError;

@@ -219,6 +219,41 @@ test('task claims fence by worker, generation, and claim token across dual handl
   }
 });
 
+test('requeueExpiredTasks skips locally active claim tokens but reclaims other expired work', () => {
+  const harness = createStoreHarness('exclude-expired-claims');
+  const storeA = harness.open();
+  const storeB = harness.open();
+
+  try {
+    const first = storeA.createTask({ key: 'active-local', payload: { index: 1 } }).task;
+    const second = storeA.createTask({ key: 'expired-remote', payload: { index: 2 } }).task;
+    const claimA = storeA.claimTask({ worker: 'worker-a', taskId: first.taskId });
+    const claimB = storeB.claimTask({ worker: 'worker-b', taskId: second.taskId });
+
+    harness.clock.tick(75);
+
+    assert.deepEqual(
+      storeA.requeueExpiredTasks({
+        excludeClaimTokens: [claimA.claimToken],
+      }),
+      [{
+        taskId: second.taskId,
+        worker: 'worker-b',
+        generation: claimB.generation,
+      }],
+    );
+
+    assert.equal(storeA.getTask(first.taskId).state, 'running');
+    assert.equal(storeA.getTask(first.taskId).claimToken, claimA.claimToken);
+    assert.equal(storeA.getTask(second.taskId).state, 'queued');
+    assert.equal(storeA.claimTask({ worker: 'worker-c', taskId: first.taskId }), null);
+  } finally {
+    storeA.close();
+    storeB.close();
+    harness.cleanup();
+  }
+});
+
 test('task creation is idempotent for canonical payload replays and conflicts on drift', () => {
   const harness = createStoreHarness('idempotent');
   const store = harness.open();
@@ -846,7 +881,7 @@ test('claimTask does not starve runnable work behind more than 100 saturated tas
   }
 });
 
-test('heartbeat and lease-holder requeue reject stale or wrong workers', () => {
+test('heartbeat renews the exact active claim after expiry but not after reclaim, and lease-holder requeue stays fenced', () => {
   const harness = createStoreHarness('heartbeat');
   const store = harness.open();
 
@@ -869,6 +904,26 @@ test('heartbeat and lease-holder requeue reject stale or wrong workers', () => {
 
     harness.clock.tick(60);
 
+    const renewed = store.heartbeatTask({
+      taskId: task.taskId,
+      worker: 'worker-a',
+      generation: claim.generation,
+      claimToken: claim.claimToken,
+    });
+    assert.equal(renewed.worker, 'worker-a');
+    assert.equal(renewed.generation, claim.generation);
+    const requeued = store.requeueTaskLease({
+      taskId: task.taskId,
+      worker: 'worker-a',
+      generation: claim.generation,
+      claimToken: claim.claimToken,
+    });
+    assert.equal(requeued.state, 'queued');
+
+    const reclaimed = store.claimTask({ worker: 'worker-c', taskId: task.taskId });
+    assert.equal(reclaimed.generation, claim.generation + 1);
+
+    harness.clock.tick(60);
     assert.equal(
       store.heartbeatTask({
         taskId: task.taskId,
@@ -878,15 +933,11 @@ test('heartbeat and lease-holder requeue reject stale or wrong workers', () => {
       }),
       null,
     );
-    assert.equal(
-      store.requeueTaskLease({
-        taskId: task.taskId,
-        worker: 'worker-a',
-        generation: claim.generation,
-        claimToken: claim.claimToken,
-      }),
-      null,
-    );
+    assert.deepEqual(store.requeueExpiredTasks(), [{
+      taskId: task.taskId,
+      worker: 'worker-c',
+      generation: reclaimed.generation,
+    }]);
   } finally {
     store.close();
     harness.cleanup();

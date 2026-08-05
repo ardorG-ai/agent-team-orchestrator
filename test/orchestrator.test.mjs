@@ -738,6 +738,264 @@ test('runWorkerOnce treats heartbeat exceptions as lease loss and aborts without
   }
 });
 
+test('runWorkerOnce excludes locally active claim tokens during expiry sweeps and releases its token on return', async () => {
+  const worktreePath = await makeWorktreeRoot('exclude-active-claims');
+  const seenExcludeLists = [];
+  const activeClaimTokens = new Set(['already-running-claim']);
+  const task = {
+    claimToken: 'new-claim',
+    generation: 3,
+    payload: { adapter: 'codex' },
+    taskId: 'task-exclude-claims',
+    worker: 'worker-exclude',
+  };
+
+  const store = {
+    appendTaskEvent() {
+      return true;
+    },
+    claimTask() {
+      return task;
+    },
+    completeTask() {
+      return {
+        outbox: {},
+        task: { result: { ok: true }, state: 'completed' },
+      };
+    },
+    heartbeatTask() {
+      return task;
+    },
+    requeueExpiredTasks(input = {}) {
+      seenExcludeLists.push(input.excludeClaimTokens ?? []);
+    },
+  };
+
+  try {
+    const result = await runWorkerOnce({
+      activeClaimTokens,
+      adapters: {
+        codex: async () => ({
+          finalMessage: 'done',
+          ok: true,
+          terminal: { status: 'success' },
+        }),
+      },
+      buildPrompt: () => 'prompt',
+      context: {
+        repoRoot: worktreePath,
+        worktreeRoot: path.dirname(worktreePath),
+      },
+      createWorktree: async () => ({
+        baseOid: '1'.repeat(40),
+        branchName: 'task-exclude-claims-g3',
+        worktreePath,
+      }),
+      snapshotWorktree: async () => ({
+        candidateOid: '2'.repeat(40),
+        clean: true,
+        worktreePath,
+      }),
+      store,
+      worker: 'worker-exclude',
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.deepEqual(seenExcludeLists, [['already-running-claim']]);
+    assert.deepEqual([...activeClaimTokens], ['already-running-claim']);
+  } finally {
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
+test('runWorkerOnce requeues instead of failing when externally interrupted during adapter execution', async () => {
+  const worktreePath = await makeWorktreeRoot('external-interrupt');
+  const controller = new AbortController();
+  let aborted = false;
+  let failCalls = 0;
+  let completeCalls = 0;
+  let requeueCalls = 0;
+
+  const task = {
+    claimToken: 'claim-interrupt',
+    generation: 1,
+    payload: { adapter: 'codex' },
+    taskId: 'task-interrupt',
+    worker: 'worker-interrupt',
+  };
+
+  const store = {
+    appendTaskEvent() {
+      return true;
+    },
+    claimTask() {
+      return task;
+    },
+    completeTask() {
+      completeCalls += 1;
+      return { outbox: {}, task: { state: 'completed' } };
+    },
+    failTask() {
+      failCalls += 1;
+      return { state: 'failed' };
+    },
+    heartbeatTask() {
+      return task;
+    },
+    requeueExpiredTasks() {},
+    requeueTaskLease(input) {
+      requeueCalls += 1;
+      return { ...task, availableAt: input.availableAt ?? null, state: 'queued' };
+    },
+  };
+
+  try {
+    const resultPromise = runWorkerOnce({
+      adapters: {
+        codex: ({ signal }) =>
+          new Promise((resolve) => {
+            const handleAbort = () => {
+              aborted = true;
+              resolve({
+                aborted: true,
+                finalMessage: 'aborted by shutdown',
+                ok: false,
+                terminal: {
+                  message: 'aborted by shutdown',
+                  status: 'failure',
+                },
+              });
+            };
+            if (signal.aborted) {
+              handleAbort();
+              return;
+            }
+            signal.addEventListener('abort', handleAbort, { once: true });
+          }),
+      },
+      buildPrompt: () => 'prompt',
+      context: {
+        repoRoot: worktreePath,
+        worktreeRoot: path.dirname(worktreePath),
+      },
+      createWorktree: async () => ({
+        baseOid: '5'.repeat(40),
+        branchName: 'task-interrupt-g1',
+        worktreePath,
+      }),
+      signal: controller.signal,
+      snapshotWorktree: async () => ({
+        candidateOid: '6'.repeat(40),
+        clean: true,
+        worktreePath,
+      }),
+      store,
+      worker: 'worker-interrupt',
+    });
+
+    controller.abort();
+    const result = await resultPromise;
+
+    assert.equal(result.status, 'interrupted');
+    assert.equal(result.task.state, 'queued');
+    assert.equal(aborted, true);
+    assert.equal(requeueCalls, 1);
+    assert.equal(failCalls, 0);
+    assert.equal(completeCalls, 0);
+  } finally {
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
+test('runWorkerOnce reports lost-lease when an external interrupt cannot return the lease', async () => {
+  const worktreePath = await makeWorktreeRoot('external-interrupt-lost-lease');
+  const controller = new AbortController();
+  let failCalls = 0;
+
+  const task = {
+    claimToken: 'claim-interrupt-lost',
+    generation: 1,
+    payload: { adapter: 'codex' },
+    taskId: 'task-interrupt-lost',
+    worker: 'worker-interrupt-lost',
+  };
+
+  const store = {
+    appendTaskEvent() {
+      return true;
+    },
+    claimTask() {
+      return task;
+    },
+    completeTask() {
+      return { outbox: {}, task: { state: 'completed' } };
+    },
+    failTask() {
+      failCalls += 1;
+      return { state: 'failed' };
+    },
+    heartbeatTask() {
+      return task;
+    },
+    requeueExpiredTasks() {},
+    requeueTaskLease() {
+      return null;
+    },
+  };
+
+  try {
+    const resultPromise = runWorkerOnce({
+      adapters: {
+        codex: ({ signal }) =>
+          new Promise((resolve) => {
+            const handleAbort = () => {
+              resolve({
+                aborted: true,
+                finalMessage: 'aborted after lease loss',
+                ok: false,
+                terminal: {
+                  message: 'aborted after lease loss',
+                  status: 'failure',
+                },
+              });
+            };
+            if (signal.aborted) {
+              handleAbort();
+              return;
+            }
+            signal.addEventListener('abort', handleAbort, { once: true });
+          }),
+      },
+      buildPrompt: () => 'prompt',
+      context: {
+        repoRoot: worktreePath,
+        worktreeRoot: path.dirname(worktreePath),
+      },
+      createWorktree: async () => ({
+        baseOid: '7'.repeat(40),
+        branchName: 'task-interrupt-lost-g1',
+        worktreePath,
+      }),
+      signal: controller.signal,
+      snapshotWorktree: async () => ({
+        candidateOid: '8'.repeat(40),
+        clean: true,
+        worktreePath,
+      }),
+      store,
+      worker: 'worker-interrupt-lost',
+    });
+
+    controller.abort();
+    const result = await resultPromise;
+
+    assert.equal(result.status, 'lost-lease');
+    assert.equal(failCalls, 0);
+  } finally {
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
 function validTeamPlan() {
   return {
     schema: 'team.plan.v1',

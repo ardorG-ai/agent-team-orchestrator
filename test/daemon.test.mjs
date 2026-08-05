@@ -75,9 +75,12 @@ test('startDaemon starts GUI and worker loops, respects concurrency, and shuts d
     assert.equal(maxConcurrent, 2);
     assert.equal(daemon.url, 'http://127.0.0.1:4317');
     assert.equal(guiOptions.daemonStatus, daemon.status);
-    assert.equal(guiOptions.runWorkerOnceFn, runWorkerOnce);
+    assert.notEqual(guiOptions.runWorkerOnceFn, runWorkerOnce);
     assert.equal(guiOptions.workerTimeoutMs, 30 * 60_000);
     assert.equal(workerOptions.every((options) => options.timeoutMs === 30 * 60_000), true);
+    assert.equal(workerOptions.every((options) => options.signal instanceof AbortSignal), true);
+    assert.equal(workerOptions.every((options) => options.signal.aborted === false), true);
+    assert.equal(workerOptions[0].activeClaimTokens, workerOptions[1].activeClaimTokens);
 
     const closePromise = daemon.close();
     await waitFor(() => guiClosed);
@@ -90,6 +93,93 @@ test('startDaemon starts GUI and worker loops, respects concurrency, and shuts d
   } finally {
     await daemon.close();
   }
+});
+
+test('startDaemon aborts every active worker before waiting for shutdown', async () => {
+  const observedSignals = [];
+  let guiClosed = false;
+
+  const daemon = await startDaemon({
+    concurrency: 2,
+    context: { repoRoot: '/repo', worktreeRoot: '/repo/.worktrees' },
+    startGuiServer: async () => ({
+      async close() {
+        guiClosed = true;
+      },
+      host: '127.0.0.1',
+      port: 4317,
+      url: 'http://127.0.0.1:4317',
+    }),
+    store: {},
+    runWorkerOnce: async ({ signal }) => {
+      observedSignals.push(signal);
+      await new Promise((resolve) => {
+        if (signal.aborted) {
+          resolve();
+          return;
+        }
+        signal.addEventListener('abort', resolve, { once: true });
+      });
+      return { status: 'interrupted' };
+    },
+  });
+
+  await waitFor(() => observedSignals.length === 2);
+  await daemon.close();
+
+  assert.equal(guiClosed, true);
+  assert.equal(observedSignals.every((signal) => signal.aborted), true);
+  assert.equal(daemon.status.activeRuns, 0);
+});
+
+test('startDaemon drains an in-flight GUI run through the shared shutdown boundary', async () => {
+  const calls = [];
+  let guiRunPromise;
+  let guiRunSettled = false;
+
+  const daemon = await startDaemon({
+    concurrency: 1,
+    context: { repoRoot: '/repo', worktreeRoot: '/repo/.worktrees' },
+    startGuiServer: async (options) => {
+      guiRunPromise = options.runWorkerOnceFn({
+        context: options.context,
+        leaseMs: 30_000,
+        store: options.store,
+        taskId: 'manual-task',
+        timeoutMs: options.workerTimeoutMs,
+        worker: 'gui-manual',
+      }).finally(() => {
+        guiRunSettled = true;
+      });
+      return {
+        async close() {
+          await guiRunPromise;
+        },
+        host: '127.0.0.1',
+        port: 4317,
+        url: 'http://127.0.0.1:4317',
+      };
+    },
+    store: {},
+    runWorkerOnce: async (options) => {
+      calls.push(options);
+      await new Promise((resolve) => {
+        if (options.signal.aborted) {
+          resolve();
+          return;
+        }
+        options.signal.addEventListener('abort', resolve, { once: true });
+      });
+      return { status: 'interrupted' };
+    },
+  });
+
+  await waitFor(() => calls.length === 2);
+  await daemon.close();
+
+  assert.equal(guiRunSettled, true);
+  assert.equal(calls.every(({ signal }) => signal.aborted), true);
+  assert.equal(calls[0].activeClaimTokens, calls[1].activeClaimTokens);
 });
 
 test('startDaemon polls on idle, survives worker failures, and keeps scheduling', async () => {
@@ -142,5 +232,52 @@ test('startDaemon polls on idle, survives worker failures, and keeps scheduling'
   } finally {
     await daemon.close();
     assert.equal(guiClosed, true);
+  }
+});
+
+test('startDaemon closes promptly while a worker is sleeping between polls', async () => {
+  const sleepCalls = [];
+  const sleepDeferreds = [];
+  let guiClosed = false;
+  let workerCalls = 0;
+
+  const daemon = await startDaemon({
+    concurrency: 1,
+    context: { repoRoot: '/repo', worktreeRoot: '/repo/.worktrees' },
+    pollMs: 5_000,
+    sleep: async (ms) => {
+      sleepCalls.push(ms);
+      const deferred = createDeferred();
+      sleepDeferreds.push(deferred);
+      return deferred.promise;
+    },
+    startGuiServer: async () => ({
+      async close() {
+        guiClosed = true;
+      },
+      host: '127.0.0.1',
+      port: 4317,
+      url: 'http://127.0.0.1:4317',
+    }),
+    store: {},
+    runWorkerOnce: async () => {
+      workerCalls += 1;
+      return { status: 'idle' };
+    },
+  });
+
+  try {
+    await waitFor(() => sleepCalls.length === 1);
+    assert.equal(workerCalls, 1);
+
+    const closePromise = daemon.close();
+    await closePromise;
+
+    assert.equal(guiClosed, true);
+    assert.equal(sleepCalls.length, 1);
+    assert.equal(workerCalls, 1);
+  } finally {
+    sleepDeferreds.forEach((deferred) => deferred.resolve());
+    await daemon.close();
   }
 });

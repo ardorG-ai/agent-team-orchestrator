@@ -2292,8 +2292,7 @@ export function openProjectStore(options) {
              AND lease_owner = ?
              AND generation = ?
              AND claim_token = ?
-             AND state = ?
-             AND claim_expires_at >= ?`,
+             AND state = ?`,
         ).run(
           claimExpiresAt,
           heartbeatAt,
@@ -2302,7 +2301,6 @@ export function openProjectStore(options) {
           generation,
           claimToken,
           TASK_STATES.running,
-          heartbeatAt,
         );
 
         if (update.changes !== 1) {
@@ -2569,11 +2567,19 @@ export function openProjectStore(options) {
       });
     },
 
-    requeueExpiredTasks({ availableAt = now() } = {}) {
+    requeueExpiredTasks({ availableAt = now(), excludeClaimTokens = [] } = {}) {
+      if (!Array.isArray(excludeClaimTokens)) {
+        throw new TypeError('excludeClaimTokens must be an array');
+      }
+      for (const claimToken of excludeClaimTokens) {
+        requireString('excludeClaimTokens[]', claimToken);
+      }
+      const excludedClaimTokens = new Set(excludeClaimTokens);
+
       return withTransaction('IMMEDIATE', () => {
         const expiredAt = now();
         const expiredRows = prepare(
-          `SELECT task_id, lease_owner, generation
+          `SELECT task_id, lease_owner, generation, claim_token
            FROM tasks
            WHERE state = ?
              AND claim_expires_at < ?
@@ -2582,6 +2588,10 @@ export function openProjectStore(options) {
 
         const updates = [];
         for (const row of expiredRows) {
+          if (excludedClaimTokens.has(row.claim_token)) {
+            continue;
+          }
+
           const update = prepare(
             `UPDATE tasks
              SET state = ?,
@@ -2592,6 +2602,7 @@ export function openProjectStore(options) {
                  updated_at = ?
              WHERE task_id = ?
                AND generation = ?
+               AND claim_token = ?
                AND state = ?
                AND claim_expires_at < ?`,
           ).run(
@@ -2600,6 +2611,7 @@ export function openProjectStore(options) {
             expiredAt,
             row.task_id,
             row.generation,
+            row.claim_token,
             TASK_STATES.running,
             expiredAt,
           );

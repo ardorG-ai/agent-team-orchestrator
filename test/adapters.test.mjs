@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { parseJsonlFragments, runClaude, runCodex } from '../src/adapters.mjs';
 import { buildAllowedEnv, runSubprocess } from '../src/subprocess.mjs';
 
 const fixturePath = fileURLToPath(new URL('./fixtures/fake-agent.mjs', import.meta.url));
+const processGroupFixturePath = fileURLToPath(new URL('./fixtures/spawn-grandchild.mjs', import.meta.url));
 const fakeEnvAllowlist = [
   'AGENT_SCENARIO',
   'FAKE_AGENT_CHUNK_SIZE',
@@ -15,6 +18,18 @@ const fakeEnvAllowlist = [
   'FAKE_AGENT_SLEEP_MS',
   'FAKE_AGENT_STDERR',
 ];
+
+async function waitFor(predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = predicate();
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('Timed out waiting for condition');
+}
 
 test('parseJsonlFragments handles chunked JSONL input', () => {
   const parsed = parseJsonlFragments([
@@ -165,6 +180,105 @@ test('runSubprocess aborts via AbortSignal and reports precedence over timeout',
   assert.equal(result.success, false);
   assert.equal(result.terminationReason, 'aborted');
   assert.equal(result.timedOut, false);
+});
+
+test('runSubprocess terminates the spawned process group on abort', async () => {
+  if (process.platform === 'win32') {
+    return;
+  }
+
+  const root = mkdtempSync(path.join(os.tmpdir(), 'run-subprocess-tree-'));
+  const pidFile = path.join(root, 'grandchild.pid');
+  const controller = new AbortController();
+
+  try {
+    const runPromise = runSubprocess({
+      command: process.execPath,
+      args: [processGroupFixturePath],
+      cwd: path.dirname(fixturePath),
+      env: {
+        FAKE_AGENT_PID_FILE: pidFile,
+      },
+      envAllowlist: [...fakeEnvAllowlist, 'FAKE_AGENT_PID_FILE'],
+      killGraceMs: 0,
+      signal: controller.signal,
+      timeoutMs: 2_000,
+    });
+
+    const grandchildPid = await waitFor(() => {
+      try {
+        return Number(readFileSync(pidFile, 'utf8'));
+      } catch {
+        return null;
+      }
+    });
+
+    controller.abort();
+    const result = await runPromise;
+
+    assert.equal(result.aborted, true);
+    assert.equal(result.success, false);
+    assert.equal(result.terminationReason, 'aborted');
+
+    await waitFor(() => {
+      try {
+        process.kill(grandchildPid, 0);
+        return false;
+      } catch (error) {
+        return error && error.code === 'ESRCH';
+      }
+    });
+  } finally {
+    controller.abort();
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test('runSubprocess cleans up background descendants after the direct child exits normally', async () => {
+  if (process.platform === 'win32') {
+    return;
+  }
+
+  const root = mkdtempSync(path.join(os.tmpdir(), 'run-subprocess-orphan-'));
+  const pidFile = path.join(root, 'grandchild.pid');
+
+  try {
+    const result = await runSubprocess({
+      command: process.execPath,
+      args: [processGroupFixturePath],
+      cwd: path.dirname(fixturePath),
+      env: {
+        FAKE_AGENT_EXIT_IMMEDIATELY: '1',
+        FAKE_AGENT_PID_FILE: pidFile,
+      },
+      envAllowlist: [...fakeEnvAllowlist, 'FAKE_AGENT_EXIT_IMMEDIATELY', 'FAKE_AGENT_PID_FILE'],
+      killGraceMs: 0,
+      timeoutMs: 2_000,
+    });
+
+    const grandchildPid = await waitFor(() => {
+      try {
+        return Number(readFileSync(pidFile, 'utf8'));
+      } catch {
+        return null;
+      }
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.terminationReason, null);
+
+    await waitFor(() => {
+      try {
+        process.kill(grandchildPid, 0);
+        return false;
+      } catch (error) {
+        return error && error.code === 'ESRCH';
+      }
+    });
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test('runSubprocess enforces stdout size cap', async () => {

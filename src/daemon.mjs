@@ -40,6 +40,31 @@ async function sleepUntilNextPoll({ pollMs, sleep, stopPromise }) {
   ]);
 }
 
+function combineAbortSignals(signals) {
+  const active = signals.filter(Boolean);
+  if (active.length === 1) {
+    return active[0];
+  }
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any(active);
+  }
+
+  const controller = new AbortController();
+  const abort = (signal) => {
+    if (!controller.signal.aborted) {
+      controller.abort(signal.reason);
+    }
+  };
+  for (const signal of active) {
+    if (signal.aborted) {
+      abort(signal);
+      break;
+    }
+    signal.addEventListener('abort', () => abort(signal), { once: true });
+  }
+  return controller.signal;
+}
+
 export async function startDaemon(options = {}) {
   requireObject('options', options);
   requireObject('options.context', options.context);
@@ -103,6 +128,19 @@ export async function startDaemon(options = {}) {
     timeoutMs,
   };
 
+  const activeClaimTokens = new Set();
+  const shutdownController = new AbortController();
+
+  function runManagedWorkerOnce(runOptions) {
+    const signal = combineAbortSignals([shutdownController.signal, runOptions.signal]);
+
+    return runWorkerOnce({
+      ...runOptions,
+      activeClaimTokens,
+      signal,
+    });
+  }
+
   let stopResolve;
   const stopPromise = new Promise((resolve) => {
     stopResolve = resolve;
@@ -113,7 +151,7 @@ export async function startDaemon(options = {}) {
     daemonStatus: status,
     host,
     port,
-    runWorkerOnceFn: runWorkerOnce,
+    runWorkerOnceFn: runManagedWorkerOnce,
     store,
     workerTimeoutMs: timeoutMs,
   });
@@ -140,7 +178,7 @@ export async function startDaemon(options = {}) {
       status.activeRuns += 1;
       let result;
       try {
-        result = await runWorkerOnce({
+        result = await runManagedWorkerOnce({
           context,
           leaseMs,
           store,
@@ -179,6 +217,7 @@ export async function startDaemon(options = {}) {
     status.running = false;
     status.stoppedAt = now();
     stopResolve();
+    shutdownController.abort();
 
     let guiCloseOutcome;
     try {
