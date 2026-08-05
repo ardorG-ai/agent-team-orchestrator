@@ -282,6 +282,7 @@ test('gui command initializes channels and owns the server lifecycle', async () 
 
 test('daemon command initializes channels, starts the scheduler, and owns the lifecycle', async () => {
   const { repo, stateRoot } = createRepository();
+  const initialSighupListeners = process.listenerCount('SIGHUP');
   let captured;
   let daemonClosed = false;
 
@@ -327,9 +328,13 @@ test('daemon command initializes channels, starts the scheduler, and owns the li
     'control',
     'review',
   ]);
+  if (process.platform !== 'win32') {
+    assert.equal(process.listenerCount('SIGHUP'), initialSighupListeners + 1);
+  }
 
   await result.close();
   assert.equal(daemonClosed, true);
+  assert.equal(process.listenerCount('SIGHUP'), initialSighupListeners);
 });
 
 test('asset commands add, list, and show Project Brain assets including --content-file', async () => {

@@ -47,6 +47,23 @@ const DEFAULT_TEAM_ADAPTERS = Object.freeze({
   test: 'codex',
   verifier: 'codex',
 });
+const SHUTDOWN_SIGNALS = Object.freeze([
+  'SIGINT',
+  'SIGTERM',
+  ...(process.platform === 'win32' ? [] : ['SIGHUP']),
+]);
+
+function attachShutdownSignals(handler) {
+  for (const signal of SHUTDOWN_SIGNALS) {
+    process.once(signal, handler);
+  }
+}
+
+function detachShutdownSignals(handler) {
+  for (const signal of SHUTDOWN_SIGNALS) {
+    process.off(signal, handler);
+  }
+}
 
 function scalarFlag(parsed, name, fallback = undefined) {
   const value = flag(parsed, name, fallback);
@@ -470,8 +487,7 @@ export async function executeCli(argv, options = {}) {
     const close = async () => {
       if (closed) return;
       closed = true;
-      process.off('SIGINT', onSignal);
-      process.off('SIGTERM', onSignal);
+      detachShutdownSignals(onSignal);
       try {
         await gui.close();
       } finally {
@@ -481,8 +497,7 @@ export async function executeCli(argv, options = {}) {
     const onSignal = () => {
       void close();
     };
-    process.once('SIGINT', onSignal);
-    process.once('SIGTERM', onSignal);
+    attachShutdownSignals(onSignal);
 
     const result = {
       host: gui.host,
@@ -532,8 +547,7 @@ export async function executeCli(argv, options = {}) {
     const close = async () => {
       if (closed) return;
       closed = true;
-      process.off('SIGINT', onSignal);
-      process.off('SIGTERM', onSignal);
+      detachShutdownSignals(onSignal);
       try {
         await daemon.close();
       } finally {
@@ -543,8 +557,7 @@ export async function executeCli(argv, options = {}) {
     const onSignal = () => {
       void close();
     };
-    process.once('SIGINT', onSignal);
-    process.once('SIGTERM', onSignal);
+    attachShutdownSignals(onSignal);
 
     const result = {
       concurrency: daemon.status?.concurrency ?? integerFlag(parsed, 'concurrency', 1, { min: 1, max: 64 }),
