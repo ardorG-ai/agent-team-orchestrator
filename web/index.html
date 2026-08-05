@@ -33,6 +33,10 @@
             <span class="nav-code" aria-hidden="true">03</span>
             <span>事件审计</span>
           </button>
+          <button class="nav-item" type="button" data-view="brain" aria-label="项目大脑">
+            <span class="nav-code" aria-hidden="true">04</span>
+            <span>项目大脑</span>
+          </button>
         </nav>
 
         <section class="agent-roster-shell" aria-labelledby="agent-roster-heading">
@@ -185,6 +189,58 @@
             </div>
           </div>
           <ol class="event-timeline" id="event-timeline"></ol>
+        </section>
+
+        <section class="view" data-view-panel="brain" aria-labelledby="brain-heading" hidden>
+          <div class="section-heading compact-heading">
+            <div>
+              <h2 id="brain-heading">项目大脑</h2>
+              <p>这里是控制器写入的只读投影，展示角色绑定、loadout 和项目级资产目录。</p>
+            </div>
+          </div>
+
+          <div class="brain-shell">
+            <section class="brain-panel" aria-labelledby="brain-roles-heading">
+              <div class="brain-panel-heading">
+                <div>
+                  <span class="section-kicker">Role bindings</span>
+                  <h3 id="brain-roles-heading">角色绑定与 Loadout</h3>
+                  <p>Builder、Reviewer、Verifier、Architect 会在控制器或 CLI 写入后出现在这里。</p>
+                </div>
+              </div>
+              <div class="brain-role-grid" id="brain-role-grid"></div>
+              <div class="empty-state brain-empty-state" id="brain-roles-empty" hidden>
+                <strong>还没有角色投影</strong>
+                <p>写入入口由控制器和 CLI 管理。绑定或 loadout 建立后，这里会自动出现当前角色配置。</p>
+              </div>
+            </section>
+
+            <section class="brain-panel" aria-labelledby="brain-memory-heading">
+              <div class="brain-panel-heading">
+                <div>
+                  <span class="section-kicker">Memory lineage</span>
+                  <h3 id="brain-memory-heading">记忆层投影</h3>
+                  <p>显示 memory 类资产的 layer、revision 与 hash，便于核对当前项目记忆处于哪一版。</p>
+                </div>
+              </div>
+              <div class="brain-memory-grid" id="brain-memory-grid"></div>
+              <div class="empty-state brain-empty-state" id="brain-memory-empty" hidden>
+                <strong>还没有记忆层记录</strong>
+                <p>项目记忆由控制器或 CLI 维护。出现 memory 资产后，这里会显示层级、版本和哈希投影。</p>
+              </div>
+            </section>
+
+            <section class="brain-panel brain-assets-panel" aria-labelledby="brain-assets-heading">
+              <div class="brain-panel-heading">
+                <div>
+                  <span class="section-kicker">Project inventory</span>
+                  <h3 id="brain-assets-heading">资产目录</h3>
+                  <p>按 memory、skill、knowledge 分组展示。默认只显示摘要和短预览，不展开完整正文。</p>
+                </div>
+              </div>
+              <div class="brain-asset-groups" id="brain-asset-groups"></div>
+            </section>
+          </div>
         </section>
       </main>
 

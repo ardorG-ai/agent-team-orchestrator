@@ -1,4 +1,5 @@
 import { runClaude, runCodex } from './adapters.mjs';
+import { renderRoleLoadout } from './project-assets.mjs';
 import { OutboxBackpressureError } from './project-store.mjs';
 import { buildTaskPrompt as defaultBuildPrompt } from './task-prompt.mjs';
 import {
@@ -106,11 +107,10 @@ function buildRuntimeEventPayload(adapterName, runResult) {
     aborted: runResult?.aborted ?? false,
     adapter: adapterName,
     exitCode: runResult?.exitCode ?? null,
-    finalMessage: runResult?.finalMessage ?? null,
     nativeSessionId: runResult?.nativeSessionId ?? null,
     nativeThreadId: runResult?.nativeThreadId ?? null,
     ok: runResult?.ok === true,
-    terminal: runResult?.terminal ?? null,
+    terminalStatus: runResult?.terminal?.status ?? null,
     timedOut: runResult?.timedOut ?? false,
   };
 }
@@ -123,6 +123,22 @@ function buildPreparationEventPayload(adapterName, requestedRef, worktree) {
     requestedRef,
     worktreePath: worktree.worktreePath,
   };
+}
+
+function resolveRoleReference(store, payload, maxBytes) {
+  if (typeof store.resolveRoleLoadout !== 'function') {
+    return null;
+  }
+
+  const role = payload.role ?? 'builder';
+  const resolved = store.resolveRoleLoadout(role);
+  if (!resolved) {
+    return null;
+  }
+
+  return renderRoleLoadout(resolved, {
+    ...(maxBytes === undefined ? {} : { maxBytes }),
+  });
 }
 
 function resolveReviewChannel(options, payload) {
@@ -247,6 +263,9 @@ export async function runWorkerOnce(options = {}) {
 
   requirePositiveInteger('options.leaseMs', leaseMs);
   requireString('options.context.worktreeRoot', options.context.worktreeRoot);
+  if (options.maxLoadoutBytes !== undefined) {
+    requirePositiveInteger('options.maxLoadoutBytes', options.maxLoadoutBytes);
+  }
 
   const adapters = {
     ...DEFAULT_ADAPTERS,
@@ -264,6 +283,26 @@ export async function runWorkerOnce(options = {}) {
   let worktree = null;
 
   try {
+    const roleReference = resolveRoleReference(store, payload, options.maxLoadoutBytes);
+    if (roleReference) {
+      const recordedLoadout = store.appendTaskEvent({
+        claimToken: claim.claimToken,
+        generation: claim.generation,
+        payload: roleReference.receipt,
+        taskId: claim.taskId,
+        type: 'loadout-snapshot',
+        worker: claim.worker,
+      });
+
+      if (!recordedLoadout || heartbeat.lost) {
+        return {
+          claim,
+          status: 'lost-lease',
+          worktree,
+        };
+      }
+    }
+
     const requestedRef = payload.baseOid ?? payload.base ?? payload.ref ?? 'HEAD';
     const adapterName = selectAdapterName(options.adapter, payload);
     const runAdapter = adapters[adapterName];
@@ -308,6 +347,7 @@ export async function runWorkerOnce(options = {}) {
       baseOid: worktree.baseOid,
       branchName: worktree.branchName,
       repoRoot: worktree.worktreePath,
+      roleReference,
       worktreePath: worktree.worktreePath,
     });
 

@@ -19,6 +19,20 @@ const state = {
   view: 'tasks',
 };
 
+const BRAIN_ROLE_ORDER = ['builder', 'reviewer', 'verifier', 'architect'];
+const BRAIN_ROLE_LABELS = {
+  architect: 'Architect',
+  builder: 'Builder',
+  reviewer: 'Reviewer',
+  verifier: 'Verifier',
+};
+const BRAIN_KIND_ORDER = ['memory', 'skill', 'knowledge'];
+const BRAIN_KIND_LABELS = {
+  knowledge: 'Knowledge',
+  memory: 'Memory',
+  skill: 'Skill',
+};
+
 const elements = {
   activityEmpty: document.querySelector('#activity-empty'),
   activityFeed: document.querySelector('#activity-feed'),
@@ -26,6 +40,11 @@ const elements = {
   agentActiveCount: document.querySelector('#agent-active-count'),
   agentRoster: document.querySelector('#agent-roster'),
   appShell: document.querySelector('#app-shell'),
+  brainAssetGroups: document.querySelector('#brain-asset-groups'),
+  brainMemoryEmpty: document.querySelector('#brain-memory-empty'),
+  brainMemoryGrid: document.querySelector('#brain-memory-grid'),
+  brainRoleGrid: document.querySelector('#brain-role-grid'),
+  brainRolesEmpty: document.querySelector('#brain-roles-empty'),
   channelGrid: document.querySelector('#channel-grid'),
   closeTaskDialog: document.querySelector('#close-task-dialog'),
   controlHealth: document.querySelector('#control-health'),
@@ -112,6 +131,27 @@ function splitList(value) {
     .filter(Boolean);
 }
 
+function compactText(value, maxLength = 180) {
+  if (value === null || value === undefined) return '';
+  let text = '';
+  if (typeof value === 'string') text = value;
+  else if (Array.isArray(value)) text = value.join(', ');
+  else if (typeof value === 'object') text = JSON.stringify(value);
+  else text = String(value);
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
+}
+
+function normalizeRole(role) {
+  return compactText(role, 80).toLowerCase();
+}
+
+function shortHash(value, size = 12) {
+  const text = compactText(value, size);
+  return text && text.length > size ? text.slice(0, size) : text || 'none';
+}
+
 function titleForState(taskState) {
   return ({
     queued: '待执行',
@@ -127,6 +167,82 @@ function taskTitle(task) {
 
 function adapterForTask(task) {
   return task?.payload?.adapter === 'claude' ? 'claude' : 'codex';
+}
+
+function loadoutIdentity(loadout) {
+  return loadout?.loadoutId ?? null;
+}
+
+function roleProjection(role) {
+  const bindings = state.snapshot?.roleLoadoutBindings ?? [];
+  const loadouts = state.snapshot?.roleLoadouts ?? [];
+  const binding = bindings.find((entry) => normalizeRole(entry?.role) === role) ?? null;
+  const loadout = binding
+    ? loadouts.find((entry) => loadoutIdentity(entry) === binding.loadoutId) ?? null
+    : loadouts.find((entry) => normalizeRole(entry?.role) === role) ?? null;
+
+  return { binding, loadout, role };
+}
+
+function projectAssets() {
+  return state.snapshot?.projectAssets ?? [];
+}
+
+function assetKind(asset) {
+  return normalizeRole(asset?.kind ?? 'knowledge') || 'knowledge';
+}
+
+function assetTitle(asset) {
+  return compactText(asset?.title ?? asset?.assetKey ?? asset?.assetId ?? 'Untitled asset', 140);
+}
+
+function assetLayer(asset) {
+  return compactText(asset?.memoryLayer, 60);
+}
+
+function assetRevision(asset) {
+  return compactText(asset?.revision, 60);
+}
+
+function assetHash(asset) {
+  return compactText(asset?.contentHash, 64);
+}
+
+function loadoutEntrySummary(loadout) {
+  const entries = Array.isArray(loadout?.entries) ? loadout.entries : [];
+  if (entries.length === 0) {
+    return '当前 loadout 没有关联资产。';
+  }
+  const modeCounts = new Map();
+  for (const entry of entries) {
+    modeCounts.set(entry.injectionMode, (modeCounts.get(entry.injectionMode) ?? 0) + 1);
+  }
+  const modeSummary = ['direct', 'summary', 'reference', 'tool']
+    .filter((mode) => modeCounts.has(mode))
+    .map((mode) => `${mode} ${modeCounts.get(mode)}`)
+    .join(' · ');
+  return `${entries.length} 个资产 · ${modeSummary}`;
+}
+
+function assetPreview(asset) {
+  const preview = compactText(asset?.preview, 120);
+  if (preview) return preview;
+  return compactText(asset?.assetKey, 120);
+}
+
+function appendFactList(container, facts) {
+  const usableFacts = facts.filter(([, value]) => value);
+  if (usableFacts.length === 0) return;
+  const list = createElement('dl', 'brain-fact-list');
+  for (const [label, value] of usableFacts) {
+    const item = document.createElement('div');
+    item.append(
+      createElement('dt', null, label),
+      createElement('dd', null, value),
+    );
+    list.append(item);
+  }
+  container.append(list);
 }
 
 function agentProjection() {
@@ -799,6 +915,137 @@ function renderEvents() {
   }
 }
 
+function renderBrainRoles() {
+  const projections = BRAIN_ROLE_ORDER
+    .map((role) => roleProjection(role))
+    .filter(({ binding, loadout }) => Boolean(binding || loadout));
+
+  elements.brainRoleGrid.replaceChildren();
+  elements.brainRolesEmpty.hidden = projections.length !== 0;
+  if (projections.length === 0) return;
+
+  for (const projection of projections) {
+    const assetCount = Array.isArray(projection.loadout?.entries)
+      ? projection.loadout.entries.length
+      : 0;
+    const card = createElement('article', 'brain-card brain-role-card');
+    const titleRow = createElement('div', 'brain-card-header');
+    titleRow.append(
+      createElement('span', 'brain-badge', BRAIN_ROLE_LABELS[projection.role] ?? projection.role),
+      createElement('span', 'brain-card-code', assetCount > 0 ? `${assetCount} assets` : 'bound'),
+    );
+
+    const heading = createElement(
+      'h4',
+      null,
+      compactText(
+        projection.loadout?.loadoutKey
+        ?? projection.binding?.loadoutId
+        ?? `${projection.role} loadout`,
+        120,
+      ),
+    );
+    const body = createElement(
+      'p',
+      'brain-card-copy',
+      projection.loadout
+        ? loadoutEntrySummary(projection.loadout)
+        : '当前角色已绑定到只读 loadout 投影。详细写入由控制器或 CLI 管理。',
+    );
+
+    card.append(titleRow, heading, body);
+    appendFactList(card, [
+      ['Bound at', projection.binding?.boundAt ? formatDate(projection.binding.boundAt) : ''],
+    ]);
+    elements.brainRoleGrid.append(card);
+  }
+}
+
+function renderBrainMemory() {
+  const memoryAssets = projectAssets().filter((asset) => assetKind(asset) === 'memory');
+  elements.brainMemoryGrid.replaceChildren();
+  elements.brainMemoryEmpty.hidden = memoryAssets.length !== 0;
+  if (memoryAssets.length === 0) return;
+
+  for (const asset of memoryAssets) {
+    const card = createElement('article', 'brain-card brain-memory-card');
+    const titleRow = createElement('div', 'brain-card-header');
+    titleRow.append(
+      createElement('span', 'brain-badge is-memory', 'Memory'),
+      createElement('span', 'brain-card-code', shortHash(asset?.assetId, 14)),
+    );
+    card.append(
+      titleRow,
+      createElement('h4', null, assetTitle(asset)),
+    );
+    appendFactList(card, [
+      ['Layer', assetLayer(asset) || 'default'],
+      ['Revision', assetRevision(asset) || 'current'],
+      ['Hash', shortHash(assetHash(asset), 16)],
+    ]);
+    card.append(createElement('p', 'brain-card-copy', assetPreview(asset) || '控制器维护的记忆资产元数据。'));
+    elements.brainMemoryGrid.append(card);
+  }
+}
+
+function renderBrainAssets() {
+  const assets = projectAssets();
+  elements.brainAssetGroups.replaceChildren();
+
+  for (const kind of BRAIN_KIND_ORDER) {
+    const groupAssets = assets.filter((asset) => assetKind(asset) === kind);
+    const section = createElement('section', 'brain-kind-section');
+    const header = createElement('div', 'brain-kind-header');
+    header.append(
+      createElement('div', null, BRAIN_KIND_LABELS[kind] ?? kind),
+      createElement('span', 'brain-kind-count', String(groupAssets.length)),
+    );
+    section.append(header);
+
+    if (groupAssets.length === 0) {
+      section.append(createElement(
+        'p',
+        'brain-kind-empty',
+        `${BRAIN_KIND_LABELS[kind] ?? kind} 资产还没有写入。新增内容会由控制器或 CLI 管理并自动投影到这里。`,
+      ));
+      elements.brainAssetGroups.append(section);
+      continue;
+    }
+
+    const grid = createElement('div', 'brain-kind-grid');
+    for (const asset of groupAssets) {
+      const card = createElement('article', 'brain-card brain-asset-card');
+      const titleRow = createElement('div', 'brain-card-header');
+      titleRow.append(
+        createElement('span', `brain-badge is-${kind}`, BRAIN_KIND_LABELS[kind] ?? kind),
+        createElement('span', 'brain-card-code', shortHash(asset?.assetId, 14)),
+      );
+      card.append(titleRow, createElement('h4', null, assetTitle(asset)));
+      const preview = assetPreview(asset);
+      card.append(createElement(
+        'p',
+        'brain-card-copy',
+        preview || '该资产当前只暴露短摘要；完整正文仍由控制器或 CLI 写入路径管理。',
+      ));
+      appendFactList(card, [
+        ['Layer', assetLayer(asset)],
+        ['Revision', assetRevision(asset)],
+        ['Hash', shortHash(assetHash(asset), 16)],
+        ['Key', compactText(asset?.assetKey, 80)],
+      ]);
+      grid.append(card);
+    }
+    section.append(grid);
+    elements.brainAssetGroups.append(section);
+  }
+}
+
+function renderBrain() {
+  renderBrainRoles();
+  renderBrainMemory();
+  renderBrainAssets();
+}
+
 function renderAll() {
   renderProject();
   renderMetrics();
@@ -810,6 +1057,7 @@ function renderAll() {
   renderReview();
   renderIntegrity();
   renderEvents();
+  renderBrain();
 }
 
 function selectTask(taskId, inspectorMode = 'summary') {
@@ -1006,7 +1254,7 @@ function initialize() {
   applyTheme();
   bindEvents();
   const initialView = location.hash.slice(1);
-  if (['tasks', 'review', 'events'].includes(initialView)) setView(initialView);
+  if (['tasks', 'review', 'events', 'brain'].includes(initialView)) setView(initialView);
   refreshSnapshot();
   window.setInterval(() => refreshSnapshot({ quiet: true }), 2_000);
 }

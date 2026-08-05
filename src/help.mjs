@@ -1,4 +1,4 @@
-export const HELP = `Agent Team Orchestrator v0.1
+export const HELP = `Agent Team Orchestrator v0.2.0-dev.0
 
 Usage:
   agent-team init [--repo PATH] [--state-root PATH] [--json]
@@ -36,6 +36,21 @@ Usage:
                               [--base OID] [--json]
   agent-team worktree snapshot TASK_ID --worker WORKER --generation N --claim-token TOKEN [--json]
 
+  agent-team asset add --key KEY --kind memory|skill|knowledge --title TEXT
+                       (--content TEXT | --content-file PATH)
+                       [--layer l1|l2|l3] [--source JSON] [--expected-revision N] [--json]
+  agent-team asset list [--kind memory|skill|knowledge] [--key-prefix PREFIX]
+                        [--limit N] [--json]
+  agent-team asset show ASSET_ID [--json]
+
+  agent-team loadout create --key KEY --role ROLE --asset ASSET_ID[:MODE[:PRIORITY]]
+                            [--asset ASSET_ID[:MODE[:PRIORITY]] ...]
+                            [--byte-budget N] [--expected-revision N] [--json]
+  agent-team loadout bind --role ROLE --loadout LOADOUT_ID
+                          [--expected-current LOADOUT_ID | --expect-unbound true|false] [--json]
+  agent-team loadout list [--role ROLE] [--limit N] [--json]
+  agent-team loadout show --role ROLE [--json]
+
   agent-team worker run --worker WORKER [--task TASK_ID] [--adapter codex|claude]
                         [--lease-ms N] [--timeout-ms N] [--review-channel CHANNEL] [--json]
 
@@ -46,5 +61,10 @@ Safety:
   The GUI binds to loopback only and keeps worker fences inside the controller.
   The daemon binds to loopback only, reuses runWorkerOnce as the sole execution boundary,
   and stops gracefully on SIGINT/SIGTERM without auto-merging or cleaning up worktrees.
-  v0.1 does not merge, update target refs, delete worktrees, or delete branches.
+  The current release does not merge, update target refs, delete worktrees, or delete branches.
+
+Project Brain:
+  Asset kinds are memory, skill, and knowledge. --layer only applies to memory assets.
+  Loadout asset modes are direct, summary, reference, and tool. Omitted mode defaults to direct.
+  Omitted loadout priority preserves listed order by assigning higher priority to earlier entries.
 `;

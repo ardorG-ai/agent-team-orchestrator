@@ -17,6 +17,8 @@ npm run daemon -- --repo . --concurrency 2
 
 The command prints a loopback capability URL such as `http://127.0.0.1:4317/#token=...`. Keep the terminal open and visit that exact URL. The browser stores the capability for the tab session and removes it from the visible address after bootstrap. Tasks created from the page or CLI are persisted in SQLite and automatically consumed by the resident worker slots.
 
+The same GUI server also exposes Project Brain read projections for project assets and role loadouts. In this slice those are inspection surfaces only; creating assets, creating loadouts, and rebinding active role context still happen through controller APIs and CLI commands.
+
 ## Two local modes
 
 | Command | GUI | Automatic queue polling | Intended use |
@@ -25,6 +27,13 @@ The command prints a loopback capability URL such as `http://127.0.0.1:4317/#tok
 | `agent-team gui` | Yes | No | Inspection and explicit manual runs |
 
 Both modes use the same project database and the same fenced worker implementation. In daemon mode, manual “run now” launches are disabled so `--concurrency` remains the total in-process Agent limit. Starting multiple controller processes is safe at the claim layer, but normally unnecessary; one resident daemon should own parallelism for a workstation.
+
+For Project Brain, the GUI currently mirrors:
+
+- `/api/project-assets` for bounded asset listings
+- `/api/role-loadouts` for role bindings, versioned loadouts, and the currently resolved role loadout
+
+These are read-only projections over SQLite. They do not make the browser a second source of truth.
 
 ## What remains resident
 
@@ -44,7 +53,7 @@ The launch URL is a local mutation capability. Do not paste it into task prompts
 
 ## What “continuous self-improvement” means here
 
-Residency solves execution continuity, not decision policy. The daemon executes durable tasks continuously, but it does not yet create speculative work, merge its own candidates, or promote `dev` to `main`.
+Residency solves execution continuity, not decision policy. The daemon executes durable tasks continuously, but it does not yet create speculative work, auto-plan a task tree, auto-spawn a parent/child Agent DAG, extract memory from runs, write Project Brain assets back automatically, merge its own candidates, or promote `dev` to `main`.
 
 The safe self-improvement path is:
 
@@ -57,6 +66,8 @@ bounded improvement proposal
 ```
 
 The first three stages can be queued and run by the resident daemon as they are implemented. Promotion remains deliberately absent until exact-OID compare-and-swap landing and recovery tests are complete.
+
+Project Brain is also not a secret-management feature. If a bound loadout uses `direct` or `summary`, that asset text enters the CLI prompt and may be repeated by the model. `reference` and `tool` modes only inject constrained locator metadata, not the underlying full source body.
 
 ## Useful options
 

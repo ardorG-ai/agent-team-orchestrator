@@ -12,7 +12,9 @@ CLI -----------------------+
 Loopback GUI -> HTTP API --+-> Project context and policy
                             -> SQLite control plane
 Resident daemon -----------+    - Task DAG
+  - Project Brain writes         - Project Brain assets
   - bounded worker slots         - Lease and fencing state
+  - loadout resolution           - Role loadouts and bindings
   - continuous queue polling     - Bounded outbox
   - graceful shutdown            - Signed hash-chain event log
                                   - Worktree and run receipts
@@ -44,9 +46,27 @@ Channels are bounded. Capacity is checked inside the same write transaction used
 
 Events use canonical JSON, `prev_hash`, SHA-256, and HMAC-SHA256. A separately signed head tuple makes simple database truncation detectable. The signing key lives outside the Git repository with mode `0600` and is never placed in an Agent subprocess environment.
 
+Project Brain events use the same chain. Asset and loadout events record non-body identifiers such as `assetId`, `assetKey`, `loadoutId`, `loadoutKey`, `revision`, `role`, and `contentHash`, but not raw memory text, `source` bodies, or loadout `entries`. Prompt-injection receipts record exact loadout and asset hashes without replaying full injected text into the audit stream.
+
 ## Git model
 
-Each attempt uses a branch and worktree derived from task ID and generation, created from an exact base commit OID. v0.1 can inspect and record a clean candidate commit but cannot merge, update the target ref, delete a branch, or delete a worktree.
+Each attempt uses a branch and worktree derived from task ID and generation, created from an exact base commit OID. The current branch can inspect and record a clean candidate commit but cannot merge, update the target ref, delete a branch, or delete a worktree.
+
+## Project Brain model
+
+Project Brain is a governed reference plane layered onto the same SQLite authority.
+
+- `project_assets` stores versioned create-only assets keyed by operator intent.
+- Assets are typed as `memory`, `skill`, or `knowledge`.
+- Memory assets can be tagged `l1`, `l2`, or `l3`.
+- `role_loadouts` stores versioned ordered asset references plus injection modes and byte budgets.
+- `role_loadout_bindings` stores one active loadout per role through an explicit controller mutation.
+
+At task-claim time the controller resolves the active loadout for `task.payload.role`, renders only bounded reference material, appends it after the required-behavior block, and records a `task.event.loadout-snapshot` receipt containing hashes, byte counts, and truncation metadata.
+
+Project Brain is not a secret store. `direct` and `summary` entries copy asset text into the worker prompt, so that material may later appear in model-visible transcripts or final output. `reference` and `tool` entries inject only bounded locator metadata such as `source` objects, not the full body of the underlying knowledge source.
+
+This is intentionally narrower than autonomous memory or planning. The controller does not yet derive assets from run output, synthesize a Planner-owned task graph, or create parent/child Agent DAGs automatically.
 
 ## Adapter model
 
@@ -58,6 +78,8 @@ Only explicitly allowlisted environment keys can reach an adapter. Controller-ow
 
 The browser reads task, channel, outbox, run, and signed-event projections from a loopback-only HTTP server. Mutations require an ephemeral per-process capability passed in the launch URL fragment, which is not sent in HTTP requests and is removed from the address bar after bootstrap. Responses remove claim and lease tokens recursively before serialization.
 
+Project Brain is exposed in this slice through read projections: project assets, role loadouts, role bindings, and the currently resolved role loadout can be inspected through the GUI server. Asset creation and loadout binding remain controller/CLI operations, not browser-authored flows.
+
 Polling is deliberate in this version. SQLite remains authoritative, and reconnecting the page reconstructs the current view without relying on an in-browser event stream.
 
 ## Resident scheduler
@@ -68,12 +90,15 @@ An idle or failed attempt backs off for the configured poll interval. A complete
 
 Shutdown is graceful: the GUI stops admitting manual runs, its active runs and the daemon worker slots settle within the configured Agent timeout, and only then does the SQLite store close. There is intentionally no merge, push, branch deletion, or worktree deletion in this path.
 
-## v0.1 non-goals
+## Current non-goals
 
 - Multi-user or multi-host operation
 - Remote brokers or databases
 - Automatic Git landing or pushing
 - Automatic worktree/branch deletion
-- Long-term semantic memory
+- Automatic Planner-owned task decomposition
+- Automatic parent/child Agent DAG synthesis
+- Automatic memory extraction, summarization, or write-back from run output
+- Long-term semantic memory beyond the governed create-only Project Brain slice
 - Native desktop packaging, login-item installation, or OS service management
 - Arbitrary third-party Agent adapters

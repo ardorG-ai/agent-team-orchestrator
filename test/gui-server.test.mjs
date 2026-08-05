@@ -186,6 +186,35 @@ test('snapshot endpoints sanitize lease tokens while exposing tasks, channels, o
   const webRoot = await harness.makeWebRoot();
 
   try {
+    store.listProjectAssets = () => [{
+      assetId: 'memory-root',
+      claimToken: 'asset-secret',
+      contentText: 'Pinned project memory summary with private full-body details.',
+      contentHash: 'abc123def456',
+      assetKey: 'memory/project-root',
+      createdAt: 101,
+      kind: 'memory',
+      memoryLayer: 'l1',
+      revision: 7,
+      title: 'Project root memory',
+      source: { secret: 'source-secret' },
+    }];
+    store.listRoleLoadoutBindings = () => [{
+      boundAt: 102,
+      claimToken: 'binding-secret',
+      loadoutId: 'builder-default',
+      role: 'builder',
+    }];
+    store.listRoleLoadouts = () => [{
+      byteBudget: 4096,
+      contentHash: 'deadbeef',
+      createdAt: 103,
+      entries: [{ assetId: 'memory-root', injectionMode: 'summary', priority: 5 }],
+      loadoutId: 'builder-default',
+      loadoutKey: 'builder/default',
+      revision: 2,
+      role: 'builder',
+    }];
     store.configureChannel({ channel: 'review', capacity: 3 });
     const task = store.createTask({
       key: 'ship',
@@ -248,10 +277,18 @@ test('snapshot endpoints sanitize lease tokens while exposing tasks, channels, o
       assert.equal(snapshot.body.channels.length, 1);
       assert.equal(snapshot.body.tasks.length, 1);
       assert.equal(snapshot.body.outbox.length, 1);
+      assert.equal(snapshot.body.projectAssets.length, 1);
+      assert.equal(snapshot.body.projectAssets[0].contentText, undefined);
+      assert.match(snapshot.body.projectAssets[0].preview, /Pinned project memory summary/);
+      assert.equal(snapshot.body.roleLoadoutBindings.length, 1);
+      assert.equal(snapshot.body.roleLoadouts.length, 1);
       assert.equal(snapshot.body.verify.eventLog.ok, true);
       assert.equal(snapshot.body.verify.integrityCheck, 'ok');
       assert.equal(JSON.stringify(snapshot.body).includes(claim.claimToken), false);
       assert.equal(JSON.stringify(snapshot.body).includes('nested-secret'), false);
+      assert.equal(JSON.stringify(snapshot.body).includes('asset-secret'), false);
+      assert.equal(JSON.stringify(snapshot.body).includes('binding-secret'), false);
+      assert.equal(JSON.stringify(snapshot.body).includes('source-secret'), false);
 
       const tasks = await fetchJson(`${server.url}/api/tasks?state=running`);
       assert.equal(tasks.body.tasks[0].claimToken, undefined);
@@ -266,6 +303,159 @@ test('snapshot endpoints sanitize lease tokens while exposing tasks, channels, o
     store.close();
     harness.cleanup([webRoot]);
   }
+});
+
+test('project brain endpoints expose bounded read-only asset and role loadout projections', async () => {
+  const harness = createStoreHarness('gui-brain-api');
+  const store = harness.open();
+  const webRoot = await harness.makeWebRoot();
+  const observed = {
+    assetCalls: [],
+    loadoutCalls: [],
+    resolveCalls: [],
+  };
+
+  try {
+    store.listProjectAssets = (options = {}) => {
+      observed.assetCalls.push(options);
+      const assets = [
+        {
+          assetId: 'memory-a',
+          assetKey: 'memory/a',
+          claimToken: 'asset-secret',
+          contentHash: 'hash-memory-a',
+          contentText: 'private memory body',
+          createdAt: 201,
+          kind: 'memory',
+          memoryLayer: 'l2',
+          revision: 3,
+          source: null,
+          title: 'Memory A',
+        },
+        {
+          assetId: 'skill-a',
+          assetKey: 'skill/a',
+          contentHash: 'hash-skill-a',
+          contentText: 'private skill body',
+          createdAt: 202,
+          kind: 'skill',
+          memoryLayer: null,
+          revision: 1,
+          source: { repo: 'handbook' },
+          title: 'Skill A',
+        },
+      ];
+      return assets
+        .filter((asset) => !options.kind || asset.kind === options.kind)
+        .slice(0, options.limit ?? assets.length);
+    };
+    store.listRoleLoadoutBindings = () => [
+      { boundAt: 203, loadoutId: 'builder-default', role: 'builder' },
+      { boundAt: 204, loadoutId: 'reviewer-default', role: 'reviewer' },
+    ];
+    store.listRoleLoadouts = (options = {}) => {
+      observed.loadoutCalls.push(options);
+      const loadouts = [
+        {
+          byteBudget: 8192,
+          claimToken: 'loadout-secret',
+          contentHash: 'hash-builder-loadout',
+          createdAt: 205,
+          entries: [{ assetId: 'memory-a', injectionMode: 'summary', priority: 5 }],
+          loadoutId: 'builder-default',
+          loadoutKey: 'builder/default',
+          revision: 2,
+          role: 'builder',
+        },
+        {
+          byteBudget: 4096,
+          contentHash: 'hash-reviewer-loadout',
+          createdAt: 206,
+          entries: [{ assetId: 'skill-a', injectionMode: 'reference', priority: 3 }],
+          loadoutId: 'reviewer-default',
+          loadoutKey: 'reviewer/default',
+          revision: 1,
+          role: 'reviewer',
+        },
+      ];
+      return loadouts
+        .filter((loadout) => !options.role || loadout.role === options.role)
+        .slice(0, options.limit ?? loadouts.length);
+    };
+    store.resolveRoleLoadout = (role) => {
+      observed.resolveCalls.push(role);
+      return role ? {
+        assets: [{
+          assetId: 'memory-a',
+          assetKey: 'memory/a',
+          claimToken: 'resolved-secret',
+          contentHash: 'hash-memory-a',
+          contentText: 'resolved body',
+          createdAt: 201,
+          injectionMode: 'summary',
+          kind: 'memory',
+          memoryLayer: 'l2',
+          priority: 5,
+          revision: 3,
+          source: null,
+          title: 'Memory A',
+        }],
+        boundAt: 203,
+        byteBudget: 8192,
+        contentHash: 'hash-builder-loadout',
+        loadoutId: `${role}-default`,
+        loadoutKey: `${role}/default`,
+        loadoutRevision: 2,
+        role,
+      } : null;
+    };
+
+    const server = await startGuiServer({
+      context: harness.context,
+      mutationToken: 'brain-token',
+      store,
+      webRoot,
+    });
+
+    try {
+      const assets = await fetchJson(`${server.url}/api/project-assets?kind=memory&limit=1`);
+      assert.equal(assets.response.status, 200);
+      assert.deepEqual(observed.assetCalls.at(-1), { kind: 'memory', limit: 1 });
+      assert.equal(assets.body.projectAssets.length, 1);
+      assert.equal(assets.body.projectAssets[0].assetId, 'memory-a');
+      assert.equal(assets.body.projectAssets[0].contentText, undefined);
+      assert.equal(assets.body.projectAssets[0].preview, 'private memory body');
+      assert.equal(JSON.stringify(assets.body).includes('asset-secret'), false);
+
+      const loadouts = await fetchJson(`${server.url}/api/role-loadouts?role=builder&limit=1`);
+      assert.equal(loadouts.response.status, 200);
+      assert.deepEqual(observed.loadoutCalls.at(-1), { limit: 1, role: 'builder' });
+      assert.equal(observed.resolveCalls.at(-1), 'builder');
+      assert.equal(loadouts.body.roleLoadoutBindings.length, 2);
+      assert.equal(loadouts.body.roleLoadouts.length, 1);
+      assert.equal(loadouts.body.resolvedRoleLoadout.loadoutId, 'builder-default');
+      assert.equal(JSON.stringify(loadouts.body).includes('loadout-secret'), false);
+      assert.equal(JSON.stringify(loadouts.body).includes('resolved-secret'), false);
+
+      const invalidLimit = await fetchJson(`${server.url}/api/project-assets?limit=999`);
+      assert.equal(invalidLimit.response.status, 400);
+      assert.equal(invalidLimit.body.error.code, 'invalid_integer');
+    } finally {
+      await server.close();
+    }
+  } finally {
+    store.close();
+    harness.cleanup([webRoot]);
+  }
+});
+
+test('brain client consumes bounded asset preview rather than raw source or content fields', async () => {
+  const appSource = await fs.readFile(new URL('../web/app.js', import.meta.url), 'utf8');
+  const assetPreviewMatch = appSource.match(/function assetPreview\(asset\) \{([\s\S]*?)\n\}/);
+  assert.ok(assetPreviewMatch, 'assetPreview() should exist');
+  assert.match(assetPreviewMatch[1], /asset\?\.preview/);
+  assert.doesNotMatch(assetPreviewMatch[1], /asset\?\.source/);
+  assert.doesNotMatch(assetPreviewMatch[1], /asset\?\.contentText/);
 });
 
 test('background task runs are registered in-process and complete through the injected worker function', async () => {

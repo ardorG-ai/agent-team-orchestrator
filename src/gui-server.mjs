@@ -11,6 +11,8 @@ import { resolveCommitOid as defaultResolveCommitOid } from './worktree.mjs';
 export const GUI_MUTATION_TOKEN_HEADER = 'x-agent-team-token';
 const DEFAULT_BODY_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_RUN_HISTORY_LIMIT = 200;
+const DEFAULT_PROJECT_ASSET_LIMIT = 120;
+const DEFAULT_ROLE_LOADOUT_LIMIT = 80;
 const DEFAULT_WORKER_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_WEB_ROOT = fileURLToPath(new URL('../web/', import.meta.url));
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -221,6 +223,81 @@ function publicDaemonStatus(status) {
   };
 }
 
+function callOptionalStoreMethod(store, methodName, ...args) {
+  const method = store?.[methodName];
+  if (typeof method !== 'function') {
+    return null;
+  }
+  return method.apply(store, args);
+}
+
+function boundedPreview(value, maxLength = 180) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return null;
+  }
+  return normalized.length <= maxLength
+    ? normalized
+    : `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function publicProjectAsset(asset) {
+  if (!asset || typeof asset !== 'object' || Array.isArray(asset)) {
+    return asset;
+  }
+
+  const {
+    contentText,
+    source: _source,
+    ...metadata
+  } = asset;
+  return {
+    ...metadata,
+    contentBytes: typeof contentText === 'string' ? Buffer.byteLength(contentText, 'utf8') : null,
+    preview: boundedPreview(contentText),
+  };
+}
+
+function listProjectAssetsProjection(store, { kind, limit = DEFAULT_PROJECT_ASSET_LIMIT } = {}) {
+  const assets = callOptionalStoreMethod(store, 'listProjectAssets', {
+    kind: kind || undefined,
+    limit,
+  });
+  return Array.isArray(assets) ? assets.map(publicProjectAsset) : [];
+}
+
+function listRoleLoadoutBindingsProjection(store) {
+  const bindings = callOptionalStoreMethod(store, 'listRoleLoadoutBindings');
+  return Array.isArray(bindings) ? bindings : [];
+}
+
+function listRoleLoadoutsProjection(store, { role, limit = DEFAULT_ROLE_LOADOUT_LIMIT } = {}) {
+  const loadouts = callOptionalStoreMethod(store, 'listRoleLoadouts', {
+    limit,
+    role: role || undefined,
+  });
+  return Array.isArray(loadouts) ? loadouts : [];
+}
+
+function resolveRoleLoadoutProjection(store, role) {
+  if (!role) {
+    return null;
+  }
+  const resolved = callOptionalStoreMethod(store, 'resolveRoleLoadout', role);
+  if (!resolved || typeof resolved !== 'object' || Array.isArray(resolved)) {
+    return null;
+  }
+  return {
+    ...resolved,
+    assets: Array.isArray(resolved.assets)
+      ? resolved.assets.map(publicProjectAsset)
+      : [],
+  };
+}
+
 function buildSnapshot({ context, daemonStatus, runRegistry, store, taskLimit, outboxLimit, eventLimit }) {
   return sanitizeForResponse({
     channels: store.listChannels(),
@@ -229,6 +306,9 @@ function buildSnapshot({ context, daemonStatus, runRegistry, store, taskLimit, o
     eventHead: store.getEventHead(),
     events: parseEvents(store, eventLimit),
     outbox: store.listOutbox({ limit: outboxLimit }),
+    projectAssets: listProjectAssetsProjection(store),
+    roleLoadoutBindings: listRoleLoadoutBindingsProjection(store),
+    roleLoadouts: listRoleLoadoutsProjection(store),
     runs: runRegistry.list(),
     tasks: store.listTasks({ limit: taskLimit }),
     verify: {
@@ -455,6 +535,28 @@ export async function startGuiServer(options = {}) {
           worker: url.searchParams.get('worker') || undefined,
         });
         sendJson(response, 200, { tasks: sanitizeForResponse(tasks) });
+        return;
+      }
+
+      if (pathname === '/api/project-assets' && method === 'GET') {
+        const limit = toInteger(url.searchParams.get('limit'), DEFAULT_PROJECT_ASSET_LIMIT, { max: 200 });
+        sendJson(response, 200, {
+          projectAssets: sanitizeForResponse(listProjectAssetsProjection(store, {
+            kind: url.searchParams.get('kind') || undefined,
+            limit,
+          })),
+        });
+        return;
+      }
+
+      if (pathname === '/api/role-loadouts' && method === 'GET') {
+        const role = url.searchParams.get('role') || undefined;
+        const limit = toInteger(url.searchParams.get('limit'), DEFAULT_ROLE_LOADOUT_LIMIT, { max: 200 });
+        sendJson(response, 200, {
+          roleLoadoutBindings: sanitizeForResponse(listRoleLoadoutBindingsProjection(store)),
+          roleLoadouts: sanitizeForResponse(listRoleLoadoutsProjection(store, { limit, role })),
+          resolvedRoleLoadout: sanitizeForResponse(resolveRoleLoadoutProjection(store, role)),
+        });
         return;
       }
 

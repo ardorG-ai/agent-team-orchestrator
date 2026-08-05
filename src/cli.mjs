@@ -35,6 +35,10 @@ const DEFAULT_CHANNELS = Object.freeze([
   { channel: 'control', capacity: 256 },
   { channel: 'review', capacity: 64 },
 ]);
+const PROJECT_ASSET_KINDS = new Set(['memory', 'skill', 'knowledge']);
+const PROJECT_MEMORY_LAYERS = new Set(['l1', 'l2', 'l3']);
+const ROLE_LOADOUT_MODES = new Set(['direct', 'summary', 'reference', 'tool']);
+const PROJECT_BRAIN_LIST_LIMIT_MAX = 1_000;
 
 function scalarFlag(parsed, name, fallback = undefined) {
   const value = flag(parsed, name, fallback);
@@ -63,6 +67,15 @@ function requiredIntegerFlag(parsed, name, options = {}) {
   return integerFlag(parsed, name, undefined, options);
 }
 
+function optionalIntegerFlag(parsed, name, fallback = undefined, options = {}) {
+  const raw = scalarFlag(parsed, name);
+  if (raw === undefined) return fallback;
+  if (raw === true || raw === '') {
+    throw new AgentTeamError('missing_argument', `--${name} is required`);
+  }
+  return integerFlag(parsed, name, undefined, options);
+}
+
 function requiredPositional(parsed, index, label) {
   const value = parsed.positionals[index];
   if (!value) {
@@ -79,6 +92,22 @@ function parseJsonValue(raw, label) {
       cause: error.message,
     });
   }
+}
+
+function enumFlag(parsed, name, allowedValues, fallback = undefined) {
+  const raw = scalarFlag(parsed, name, undefined);
+  if (raw === undefined) return fallback;
+  if (raw === true || raw === '') {
+    throw new AgentTeamError('missing_argument', `--${name} is required`);
+  }
+  const value = String(raw);
+  if (!allowedValues.has(value)) {
+    throw new AgentTeamError(
+      'invalid_argument',
+      `--${name} must be one of ${[...allowedValues].join('|')}`,
+    );
+  }
+  return value;
 }
 
 function jsonFlag(parsed, name, fallback = undefined) {
@@ -118,6 +147,30 @@ function contextOptions(parsed) {
 
 function repositoryPath(parsed, cwd) {
   return optionalStringFlag(parsed, 'repo', cwd);
+}
+
+function readUtf8File(cwd, filePath, label) {
+  const resolvedPath = path.resolve(cwd, filePath);
+  try {
+    return readFileSync(resolvedPath, 'utf8');
+  } catch (error) {
+    throw new AgentTeamError('file_read_error', `Cannot read ${label}: ${filePath}`, {
+      cause: error.message,
+      path: resolvedPath,
+    });
+  }
+}
+
+function requireStoreMethod(store, methodName, command) {
+  if (typeof store[methodName] !== 'function') {
+    throw new AgentTeamError(
+      'unsupported_command',
+      `${command} is not available in this build`,
+      { methodName },
+      2,
+    );
+  }
+  return store[methodName].bind(store);
 }
 
 async function withProjectStore(parsed, dependencies, callback) {
@@ -195,7 +248,7 @@ function taskPayload(parsed, baseOid) {
     if (scalarFlag(parsed, deferredFlag) !== undefined) {
       throw new AgentTeamError(
         'unsupported_argument',
-        `--${deferredFlag} is not enforced in v0.1 and is intentionally unavailable`,
+        `--${deferredFlag} is not enforced in the current release and is intentionally unavailable`,
       );
     }
   }
@@ -214,6 +267,78 @@ function taskPayload(parsed, baseOid) {
     scope,
     title: requiredStringFlag(parsed, 'title'),
   };
+}
+
+function projectAssetContent(parsed, cwd) {
+  const inlineContent = scalarFlag(parsed, 'content');
+  const contentFile = scalarFlag(parsed, 'content-file');
+
+  if (inlineContent !== undefined && contentFile !== undefined) {
+    throw new AgentTeamError(
+      'invalid_argument',
+      '--content and --content-file are mutually exclusive',
+    );
+  }
+
+  if (inlineContent === undefined && contentFile === undefined) {
+    throw new AgentTeamError(
+      'missing_argument',
+      'either --content or --content-file is required',
+    );
+  }
+
+  if (inlineContent !== undefined) {
+    if (inlineContent === true || inlineContent === '') {
+      throw new AgentTeamError('missing_argument', '--content is required');
+    }
+    return String(inlineContent);
+  }
+
+  const filePath = requiredStringFlag(parsed, 'content-file');
+  return readUtf8File(cwd, filePath, '--content-file');
+}
+
+function parseLoadoutEntryToken(token, index, total) {
+  const parts = String(token).split(':');
+  if (parts.length < 1 || parts.length > 3 || parts[0] === '') {
+    throw new AgentTeamError(
+      'invalid_argument',
+      `--asset value "${token}" must be ASSET_ID, ASSET_ID:MODE, or ASSET_ID:MODE:PRIORITY`,
+    );
+  }
+
+  const [assetId, modeToken, priorityToken] = parts;
+  const injectionMode = modeToken === undefined ? 'direct' : modeToken;
+  if (!ROLE_LOADOUT_MODES.has(injectionMode)) {
+    throw new AgentTeamError(
+      'invalid_argument',
+      `--asset value "${token}" uses unsupported mode "${injectionMode}"`,
+    );
+  }
+
+  const priority = priorityToken === undefined
+    ? total - index
+    : Number(priorityToken);
+  if (!Number.isSafeInteger(priority)) {
+    throw new AgentTeamError(
+      'invalid_argument',
+      `--asset value "${token}" has an invalid priority`,
+    );
+  }
+
+  return {
+    assetId,
+    injectionMode,
+    priority,
+  };
+}
+
+function loadoutEntries(parsed) {
+  const assets = listFlag(parsed, 'asset');
+  if (assets.length === 0) {
+    throw new AgentTeamError('missing_argument', 'at least one --asset is required');
+  }
+  return assets.map((token, index) => parseLoadoutEntryToken(token, index, assets.length));
 }
 
 function commandKey(parsed) {
@@ -240,7 +365,7 @@ export async function executeCli(argv, options = {}) {
     return HELP;
   }
   if (booleanFlag(parsed, 'version') || parsed.positionals[0] === 'version') {
-    return '0.1.1';
+    return '0.2.0-dev.0';
   }
 
   const command = commandKey(parsed);
@@ -479,6 +604,117 @@ export async function executeCli(argv, options = {}) {
         throw new AgentTeamError('retry_conflict', `Task ${taskId} is not failed at generation ${expectedGeneration}`);
       }
       return retried;
+    });
+  }
+
+  if (command === 'asset add') {
+    return withProjectStore(parsed, dependencies, async ({ store }) => {
+      const createProjectAsset = requireStoreMethod(store, 'createProjectAsset', 'asset add');
+      const kind = enumFlag(parsed, 'kind', PROJECT_ASSET_KINDS);
+      const layer = enumFlag(parsed, 'layer', PROJECT_MEMORY_LAYERS, null);
+      if (kind === undefined) {
+        throw new AgentTeamError('missing_argument', '--kind is required');
+      }
+      if (kind !== 'memory' && layer !== null) {
+        throw new AgentTeamError('invalid_argument', '--layer is only allowed when --kind=memory');
+      }
+      return createProjectAsset({
+        assetKey: requiredStringFlag(parsed, 'key'),
+        kind,
+        memoryLayer: layer,
+        title: requiredStringFlag(parsed, 'title'),
+        contentText: projectAssetContent(parsed, dependencies.cwd),
+        source: jsonFlag(parsed, 'source', null),
+        expectedRevision: optionalIntegerFlag(parsed, 'expected-revision', 0, { min: 0 }),
+      });
+    });
+  }
+
+  if (command === 'asset list') {
+    return withProjectStore(parsed, dependencies, async ({ store }) => {
+      const listProjectAssets = requireStoreMethod(store, 'listProjectAssets', 'asset list');
+      const limit = optionalIntegerFlag(parsed, 'limit', 100, {
+        min: 1,
+        max: PROJECT_BRAIN_LIST_LIMIT_MAX,
+      });
+      return listProjectAssets({
+        keyPrefix: optionalStringFlag(parsed, 'key-prefix'),
+        kind: enumFlag(parsed, 'kind', PROJECT_ASSET_KINDS),
+        limit,
+      });
+    });
+  }
+
+  if (command === 'asset show') {
+    return withProjectStore(parsed, dependencies, async ({ store }) => {
+      const getProjectAsset = requireStoreMethod(store, 'getProjectAsset', 'asset show');
+      const assetId = requiredPositional(parsed, 2, 'ASSET_ID');
+      const asset = getProjectAsset(assetId);
+      if (!asset) throw new AgentTeamError('asset_not_found', `Project asset not found: ${assetId}`, undefined, 2);
+      return asset;
+    });
+  }
+
+  if (command === 'loadout create') {
+    return withProjectStore(parsed, dependencies, async ({ store }) => {
+      const createRoleLoadout = requireStoreMethod(store, 'createRoleLoadout', 'loadout create');
+      return createRoleLoadout({
+        loadoutKey: requiredStringFlag(parsed, 'key'),
+        role: requiredStringFlag(parsed, 'role'),
+        entries: loadoutEntries(parsed),
+        byteBudget: optionalIntegerFlag(parsed, 'byte-budget', undefined, { min: 1 }),
+        expectedRevision: optionalIntegerFlag(parsed, 'expected-revision', 0, { min: 0 }),
+      });
+    });
+  }
+
+  if (command === 'loadout bind') {
+    return withProjectStore(parsed, dependencies, async ({ store }) => {
+      const bindRoleLoadout = requireStoreMethod(store, 'bindRoleLoadout', 'loadout bind');
+      const expectedCurrentLoadoutId = optionalStringFlag(parsed, 'expected-current');
+      const expectUnboundRaw = scalarFlag(parsed, 'expect-unbound');
+      if (expectedCurrentLoadoutId !== undefined && expectUnboundRaw !== undefined) {
+        throw new AgentTeamError(
+          'invalid_argument',
+          '--expected-current and --expect-unbound are mutually exclusive',
+        );
+      }
+
+      const expectUnbound = expectUnboundRaw === undefined
+        ? undefined
+        : booleanFlag(parsed, 'expect-unbound');
+      return bindRoleLoadout({
+        role: requiredStringFlag(parsed, 'role'),
+        loadoutId: requiredStringFlag(parsed, 'loadout'),
+        ...(expectedCurrentLoadoutId !== undefined
+          ? { expectedCurrentLoadoutId }
+          : expectUnbound === true
+            ? { expectedCurrentLoadoutId: null }
+            : {}),
+      });
+    });
+  }
+
+  if (command === 'loadout list') {
+    return withProjectStore(parsed, dependencies, async ({ store }) => {
+      const listRoleLoadouts = requireStoreMethod(store, 'listRoleLoadouts', 'loadout list');
+      return listRoleLoadouts({
+        role: optionalStringFlag(parsed, 'role'),
+        limit: optionalIntegerFlag(parsed, 'limit', 100, {
+          min: 1,
+          max: PROJECT_BRAIN_LIST_LIMIT_MAX,
+        }),
+      });
+    });
+  }
+
+  if (command === 'loadout show') {
+    return withProjectStore(parsed, dependencies, async ({ store }) => {
+      const resolveRoleLoadout = requireStoreMethod(store, 'resolveRoleLoadout', 'loadout show');
+      const role = requiredStringFlag(parsed, 'role');
+      const resolved = resolveRoleLoadout(role);
+      if (!resolved) throw new AgentTeamError('loadout_not_found', `No active role loadout for role: ${role}`, undefined, 2);
+      return resolved;
     });
   }
 

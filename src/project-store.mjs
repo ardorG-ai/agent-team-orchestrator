@@ -20,6 +20,13 @@ const OUTBOX_STATES = {
   acked: 'acked',
 };
 
+const PROJECT_ASSET_KINDS = new Set(['memory', 'skill', 'knowledge']);
+const PROJECT_MEMORY_LAYERS = new Set(['l1', 'l2', 'l3']);
+const ROLE_LOADOUT_INJECTION_MODES = new Set(['direct', 'summary', 'reference', 'tool']);
+const PROJECT_ASSET_MAX_CONTENT_BYTES = 65_536;
+const ROLE_LOADOUT_DEFAULT_BYTE_BUDGET = 8_192;
+const ROLE_LOADOUT_MAX_BYTE_BUDGET = 65_536;
+
 const MIGRATIONS = [
   {
     version: 1,
@@ -100,6 +107,58 @@ const MIGRATIONS = [
       );
     `,
   },
+  {
+    version: 2,
+    sql: `
+      CREATE TABLE IF NOT EXISTS project_assets (
+        asset_id TEXT PRIMARY KEY,
+        asset_key TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        kind TEXT NOT NULL CHECK(kind IN ('memory', 'skill', 'knowledge')),
+        memory_layer TEXT CHECK(memory_layer IS NULL OR memory_layer IN ('l1', 'l2', 'l3')),
+        title TEXT NOT NULL,
+        content_text TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(asset_key, revision)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_project_assets_key_revision
+        ON project_assets(asset_key, revision DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_project_assets_kind_layer_created
+        ON project_assets(kind, memory_layer, created_at, asset_id);
+
+      CREATE TABLE IF NOT EXISTS role_loadouts (
+        loadout_id TEXT PRIMARY KEY,
+        loadout_key TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        role TEXT NOT NULL,
+        entries_json TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        byte_budget INTEGER NOT NULL CHECK(byte_budget > 0 AND byte_budget <= 65536),
+        created_at INTEGER NOT NULL,
+        UNIQUE(loadout_key, revision)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_role_loadouts_key_revision
+        ON role_loadouts(loadout_key, revision DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_role_loadouts_role_created
+        ON role_loadouts(role, created_at, loadout_id);
+
+      CREATE TABLE IF NOT EXISTS role_loadout_bindings (
+        role TEXT PRIMARY KEY,
+        loadout_id TEXT NOT NULL,
+        bound_at INTEGER NOT NULL,
+        FOREIGN KEY (loadout_id) REFERENCES role_loadouts(loadout_id) ON DELETE RESTRICT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_role_loadout_bindings_loadout
+        ON role_loadout_bindings(loadout_id);
+    `,
+  },
 ];
 
 export class TaskConflictError extends Error {
@@ -144,6 +203,194 @@ function requirePositiveInteger(name, value) {
   if (!Number.isInteger(value) || value <= 0) {
     throw new TypeError(`${name} must be a positive integer`);
   }
+}
+
+function requireNonNegativeInteger(name, value) {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative integer`);
+  }
+}
+
+function requireAnyString(name, value) {
+  if (typeof value !== 'string') {
+    throw new TypeError(`${name} must be a string`);
+  }
+}
+
+function requireEnum(name, value, allowedValues) {
+  if (typeof value !== 'string' || !allowedValues.has(value)) {
+    throw new TypeError(`${name} must be one of: ${[...allowedValues].join(', ')}`);
+  }
+}
+
+function requireNullableEnum(name, value, allowedValues) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  requireEnum(name, value, allowedValues);
+  return value;
+}
+
+function assertMaxUtf8Bytes(name, value, maxBytes) {
+  requireAnyString(name, value);
+  const size = Buffer.byteLength(value, 'utf8');
+  if (size > maxBytes) {
+    throw new TypeError(`${name} must be <= ${maxBytes} UTF-8 bytes`);
+  }
+}
+
+function escapeSqlLikePattern(value) {
+  return value
+    .replaceAll('\\', '\\\\')
+    .replaceAll('%', '\\%')
+    .replaceAll('_', '\\_');
+}
+
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) {
+    return value;
+  }
+  Object.freeze(value);
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      deepFreeze(entry);
+    }
+    return value;
+  }
+  for (const nested of Object.values(value)) {
+    deepFreeze(nested);
+  }
+  return value;
+}
+
+function normalizeRoleLoadoutEntry(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new TypeError('entries must contain plain objects');
+  }
+
+  requireString('entry.assetId', entry.assetId);
+  requireEnum('entry.injectionMode', entry.injectionMode, ROLE_LOADOUT_INJECTION_MODES);
+  if (!Number.isInteger(entry.priority)) {
+    throw new TypeError('entry.priority must be an integer');
+  }
+
+  return {
+    assetId: entry.assetId,
+    injectionMode: entry.injectionMode,
+    priority: entry.priority,
+  };
+}
+
+function normalizeRoleLoadoutEntries(entries) {
+  if (!Array.isArray(entries)) {
+    throw new TypeError('entries must be an array');
+  }
+
+  const seenAssetIds = new Set();
+  const normalized = entries.map(normalizeRoleLoadoutEntry);
+  for (const entry of normalized) {
+    if (seenAssetIds.has(entry.assetId)) {
+      throw new TypeError(`Duplicate assetId in entries: ${entry.assetId}`);
+    }
+    seenAssetIds.add(entry.assetId);
+  }
+
+  normalized.sort((left, right) => {
+    if (right.priority !== left.priority) {
+      return right.priority - left.priority;
+    }
+    return left.assetId.localeCompare(right.assetId);
+  });
+
+  return normalized;
+}
+
+function normalizeProjectAssetInput({
+  assetKey,
+  kind,
+  memoryLayer = null,
+  title,
+  contentText,
+  source = null,
+  expectedRevision,
+  assetId,
+}) {
+  requireString('assetKey', assetKey);
+  requireString('assetId', assetId);
+  requireNonNegativeInteger('expectedRevision', expectedRevision);
+  requireEnum('kind', kind, PROJECT_ASSET_KINDS);
+
+  const normalizedMemoryLayer = requireNullableEnum(
+    'memoryLayer',
+    memoryLayer,
+    PROJECT_MEMORY_LAYERS,
+  );
+  if (kind !== 'memory' && normalizedMemoryLayer !== null) {
+    throw new TypeError('memoryLayer is only allowed for memory assets');
+  }
+
+  requireString('title', title);
+  assertMaxUtf8Bytes('contentText', contentText, PROJECT_ASSET_MAX_CONTENT_BYTES);
+
+  const sourceJson = canonicalStringify(source);
+  const normalizedSource = canonicalParse(sourceJson);
+  const contentHash = canonicalHash({
+    kind,
+    memoryLayer: normalizedMemoryLayer,
+    title,
+    contentText,
+    source: normalizedSource,
+  });
+
+  return {
+    assetId,
+    assetKey,
+    expectedRevision,
+    kind,
+    memoryLayer: normalizedMemoryLayer,
+    title,
+    contentText,
+    sourceJson,
+    normalizedSource,
+    contentHash,
+  };
+}
+
+function normalizeRoleLoadoutInput({
+  loadoutKey,
+  role,
+  entries,
+  byteBudget = ROLE_LOADOUT_DEFAULT_BYTE_BUDGET,
+  expectedRevision,
+  loadoutId,
+}) {
+  requireString('loadoutKey', loadoutKey);
+  requireString('role', role);
+  requireString('loadoutId', loadoutId);
+  requireNonNegativeInteger('expectedRevision', expectedRevision);
+  requirePositiveInteger('byteBudget', byteBudget);
+  if (byteBudget > ROLE_LOADOUT_MAX_BYTE_BUDGET) {
+    throw new TypeError(`byteBudget must be <= ${ROLE_LOADOUT_MAX_BYTE_BUDGET}`);
+  }
+
+  const normalizedEntries = normalizeRoleLoadoutEntries(entries);
+  const entriesJson = canonicalStringify(normalizedEntries);
+  const contentHash = canonicalHash({
+    role,
+    entries: normalizedEntries,
+    byteBudget,
+  });
+
+  return {
+    loadoutId,
+    loadoutKey,
+    role,
+    expectedRevision,
+    byteBudget,
+    entries: normalizedEntries,
+    entriesJson,
+    contentHash,
+  };
 }
 
 function rowToTask(row) {
@@ -202,6 +449,54 @@ function rowToChannel(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     pendingDepth: row.pending_depth ?? 0,
+  };
+}
+
+function rowToProjectAsset(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    assetId: row.asset_id,
+    assetKey: row.asset_key,
+    revision: row.revision,
+    kind: row.kind,
+    memoryLayer: row.memory_layer,
+    title: row.title,
+    contentText: row.content_text,
+    contentHash: row.content_hash,
+    source: parseJsonColumn(row.source_json),
+    createdAt: row.created_at,
+  };
+}
+
+function rowToRoleLoadout(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    loadoutId: row.loadout_id,
+    loadoutKey: row.loadout_key,
+    revision: row.revision,
+    role: row.role,
+    entries: parseJsonColumn(row.entries_json),
+    contentHash: row.content_hash,
+    byteBudget: row.byte_budget,
+    createdAt: row.created_at,
+  };
+}
+
+function rowToRoleLoadoutBinding(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    role: row.role,
+    loadoutId: row.loadout_id,
+    boundAt: row.bound_at,
   };
 }
 
@@ -415,6 +710,62 @@ export function openProjectStore(options) {
 
   function getOutboxRowById(messageId) {
     return prepare('SELECT * FROM outbox WHERE message_id = ?').get(messageId);
+  }
+
+  function getProjectAssetRowById(assetId) {
+    return prepare('SELECT * FROM project_assets WHERE asset_id = ?').get(assetId);
+  }
+
+  function getProjectAssetRowByKeyRevision(assetKey, revision) {
+    return prepare(
+      'SELECT * FROM project_assets WHERE asset_key = ? AND revision = ?',
+    ).get(assetKey, revision);
+  }
+
+  function getLatestProjectAssetRow(assetKey) {
+    return prepare(
+      'SELECT * FROM project_assets WHERE asset_key = ? ORDER BY revision DESC LIMIT 1',
+    ).get(assetKey);
+  }
+
+  function getRoleLoadoutRowById(loadoutId) {
+    return prepare('SELECT * FROM role_loadouts WHERE loadout_id = ?').get(loadoutId);
+  }
+
+  function getRoleLoadoutRowByKeyRevision(loadoutKey, revision) {
+    return prepare(
+      'SELECT * FROM role_loadouts WHERE loadout_key = ? AND revision = ?',
+    ).get(loadoutKey, revision);
+  }
+
+  function getLatestRoleLoadoutRow(loadoutKey) {
+    return prepare(
+      'SELECT * FROM role_loadouts WHERE loadout_key = ? ORDER BY revision DESC LIMIT 1',
+    ).get(loadoutKey);
+  }
+
+  function getRoleLoadoutBindingRow(role) {
+    return prepare('SELECT * FROM role_loadout_bindings WHERE role = ?').get(role);
+  }
+
+  function isProjectAssetReplay(row, candidate) {
+    return (
+      row.kind === candidate.kind &&
+      row.memory_layer === candidate.memoryLayer &&
+      row.title === candidate.title &&
+      row.content_text === candidate.contentText &&
+      row.content_hash === candidate.contentHash &&
+      row.source_json === candidate.sourceJson
+    );
+  }
+
+  function isRoleLoadoutReplay(row, candidate) {
+    return (
+      row.role === candidate.role &&
+      row.entries_json === candidate.entriesJson &&
+      row.content_hash === candidate.contentHash &&
+      row.byte_budget === candidate.byteBudget
+    );
   }
 
   function getChannelRow(channel) {
@@ -692,6 +1043,449 @@ export function openProjectStore(options) {
       )
         .all(OUTBOX_STATES.acked)
         .map(rowToChannel);
+    },
+
+    createProjectAsset({
+      assetKey,
+      kind,
+      memoryLayer = null,
+      title,
+      contentText,
+      source = null,
+      expectedRevision = 0,
+      assetId = generateId(),
+    }) {
+      const candidate = normalizeProjectAssetInput({
+        assetKey,
+        kind,
+        memoryLayer,
+        title,
+        contentText,
+        source,
+        expectedRevision,
+        assetId,
+      });
+
+      return withTransaction('IMMEDIATE', () => {
+        const replayRevision = candidate.expectedRevision + 1;
+        const replay = getProjectAssetRowByKeyRevision(candidate.assetKey, replayRevision);
+        if (replay) {
+          if (isProjectAssetReplay(replay, candidate)) {
+            return {
+              status: 'replayed',
+              asset: rowToProjectAsset(replay),
+            };
+          }
+          throw new TaskConflictError(
+            `Project asset "${candidate.assetKey}" revision ${replayRevision} already exists with different content`,
+            {
+              assetKey: candidate.assetKey,
+              revision: replayRevision,
+              existingAssetId: replay.asset_id,
+              existingContentHash: replay.content_hash,
+              requestedContentHash: candidate.contentHash,
+            },
+          );
+        }
+
+        const latest = getLatestProjectAssetRow(candidate.assetKey);
+        const latestRevision = latest?.revision ?? 0;
+        if (latestRevision !== candidate.expectedRevision) {
+          throw new TaskConflictError(
+            `Project asset "${candidate.assetKey}" expected revision ${candidate.expectedRevision} but latest is ${latestRevision}`,
+            {
+              assetKey: candidate.assetKey,
+              expectedRevision: candidate.expectedRevision,
+              latestRevision,
+              latestAssetId: latest?.asset_id ?? null,
+            },
+          );
+        }
+
+        const revision = latestRevision + 1;
+        const createdAt = now();
+        prepare(
+          `INSERT INTO project_assets(
+            asset_id,
+            asset_key,
+            revision,
+            kind,
+            memory_layer,
+            title,
+            content_text,
+            content_hash,
+            source_json,
+            created_at
+          ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          candidate.assetId,
+          candidate.assetKey,
+          revision,
+          candidate.kind,
+          candidate.memoryLayer,
+          candidate.title,
+          candidate.contentText,
+          candidate.contentHash,
+          candidate.sourceJson,
+          createdAt,
+        );
+
+        appendEvent('project-asset.created', 'project_asset', candidate.assetId, {
+          assetId: candidate.assetId,
+          assetKey: candidate.assetKey,
+          revision,
+          contentHash: candidate.contentHash,
+        });
+
+        return {
+          status: 'created',
+          asset: rowToProjectAsset(getProjectAssetRowById(candidate.assetId)),
+        };
+      });
+    },
+
+    getProjectAsset(query) {
+      if (typeof query === 'string') {
+        return rowToProjectAsset(getProjectAssetRowById(query));
+      }
+      if (!query || typeof query !== 'object' || Array.isArray(query)) {
+        throw new TypeError('getProjectAsset requires an assetId string or query object');
+      }
+
+      if (query.assetId !== undefined) {
+        requireString('assetId', query.assetId);
+        return rowToProjectAsset(getProjectAssetRowById(query.assetId));
+      }
+
+      requireString('assetKey', query.assetKey);
+      if (query.revision === undefined) {
+        return rowToProjectAsset(getLatestProjectAssetRow(query.assetKey));
+      }
+
+      requirePositiveInteger('revision', query.revision);
+      return rowToProjectAsset(
+        getProjectAssetRowByKeyRevision(query.assetKey, query.revision),
+      );
+    },
+
+    listProjectAssets(filters = {}) {
+      const clauses = [];
+      const params = [];
+
+      if (filters.assetKey) {
+        requireString('assetKey', filters.assetKey);
+        clauses.push('asset_key = ?');
+        params.push(filters.assetKey);
+      }
+      if (filters.keyPrefix) {
+        requireString('keyPrefix', filters.keyPrefix);
+        clauses.push("asset_key LIKE ? ESCAPE '\\'");
+        params.push(`${escapeSqlLikePattern(filters.keyPrefix)}%`);
+      }
+      if (filters.kind) {
+        requireEnum('kind', filters.kind, PROJECT_ASSET_KINDS);
+        clauses.push('kind = ?');
+        params.push(filters.kind);
+      }
+      if (filters.memoryLayer !== undefined && filters.memoryLayer !== null) {
+        requireEnum('memoryLayer', filters.memoryLayer, PROJECT_MEMORY_LAYERS);
+        clauses.push('memory_layer = ?');
+        params.push(filters.memoryLayer);
+      }
+
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const limit = filters.limit ?? 100;
+      requirePositiveInteger('limit', limit);
+
+      return prepare(
+        `SELECT *
+         FROM project_assets
+         ${where}
+         ORDER BY asset_key, revision DESC, asset_id
+         LIMIT ?`,
+      )
+        .all(...params, limit)
+        .map(rowToProjectAsset);
+    },
+
+    createRoleLoadout({
+      loadoutKey,
+      role,
+      entries,
+      byteBudget = ROLE_LOADOUT_DEFAULT_BYTE_BUDGET,
+      expectedRevision = 0,
+      loadoutId = generateId(),
+    }) {
+      const candidate = normalizeRoleLoadoutInput({
+        loadoutKey,
+        role,
+        entries,
+        byteBudget,
+        expectedRevision,
+        loadoutId,
+      });
+
+      return withTransaction('IMMEDIATE', () => {
+        for (const entry of candidate.entries) {
+          if (!getProjectAssetRowById(entry.assetId)) {
+            throw new Error(`Unknown project asset: ${entry.assetId}`);
+          }
+        }
+
+        const replayRevision = candidate.expectedRevision + 1;
+        const replay = getRoleLoadoutRowByKeyRevision(candidate.loadoutKey, replayRevision);
+        if (replay) {
+          if (isRoleLoadoutReplay(replay, candidate)) {
+            return {
+              status: 'replayed',
+              loadout: rowToRoleLoadout(replay),
+            };
+          }
+          throw new TaskConflictError(
+            `Role loadout "${candidate.loadoutKey}" revision ${replayRevision} already exists with different content`,
+            {
+              loadoutKey: candidate.loadoutKey,
+              revision: replayRevision,
+              existingLoadoutId: replay.loadout_id,
+              existingContentHash: replay.content_hash,
+              requestedContentHash: candidate.contentHash,
+            },
+          );
+        }
+
+        const latest = getLatestRoleLoadoutRow(candidate.loadoutKey);
+        const latestRevision = latest?.revision ?? 0;
+        if (latestRevision !== candidate.expectedRevision) {
+          throw new TaskConflictError(
+            `Role loadout "${candidate.loadoutKey}" expected revision ${candidate.expectedRevision} but latest is ${latestRevision}`,
+            {
+              loadoutKey: candidate.loadoutKey,
+              expectedRevision: candidate.expectedRevision,
+              latestRevision,
+              latestLoadoutId: latest?.loadout_id ?? null,
+            },
+          );
+        }
+
+        const revision = latestRevision + 1;
+        const createdAt = now();
+        prepare(
+          `INSERT INTO role_loadouts(
+            loadout_id,
+            loadout_key,
+            revision,
+            role,
+            entries_json,
+            content_hash,
+            byte_budget,
+            created_at
+          ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          candidate.loadoutId,
+          candidate.loadoutKey,
+          revision,
+          candidate.role,
+          candidate.entriesJson,
+          candidate.contentHash,
+          candidate.byteBudget,
+          createdAt,
+        );
+
+        appendEvent('role-loadout.created', 'role_loadout', candidate.loadoutId, {
+          loadoutId: candidate.loadoutId,
+          loadoutKey: candidate.loadoutKey,
+          revision,
+          role: candidate.role,
+          contentHash: candidate.contentHash,
+        });
+
+        return {
+          status: 'created',
+          loadout: rowToRoleLoadout(getRoleLoadoutRowById(candidate.loadoutId)),
+        };
+      });
+    },
+
+    getRoleLoadout(query) {
+      if (typeof query === 'string') {
+        return rowToRoleLoadout(getRoleLoadoutRowById(query));
+      }
+      if (!query || typeof query !== 'object' || Array.isArray(query)) {
+        throw new TypeError('getRoleLoadout requires a loadoutId string or query object');
+      }
+
+      if (query.loadoutId !== undefined) {
+        requireString('loadoutId', query.loadoutId);
+        return rowToRoleLoadout(getRoleLoadoutRowById(query.loadoutId));
+      }
+
+      requireString('loadoutKey', query.loadoutKey);
+      if (query.revision === undefined) {
+        return rowToRoleLoadout(getLatestRoleLoadoutRow(query.loadoutKey));
+      }
+
+      requirePositiveInteger('revision', query.revision);
+      return rowToRoleLoadout(
+        getRoleLoadoutRowByKeyRevision(query.loadoutKey, query.revision),
+      );
+    },
+
+    listRoleLoadouts(filters = {}) {
+      const clauses = [];
+      const params = [];
+
+      if (filters.loadoutKey) {
+        requireString('loadoutKey', filters.loadoutKey);
+        clauses.push('loadout_key = ?');
+        params.push(filters.loadoutKey);
+      }
+      if (filters.role) {
+        requireString('role', filters.role);
+        clauses.push('role = ?');
+        params.push(filters.role);
+      }
+
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const limit = filters.limit ?? 100;
+      requirePositiveInteger('limit', limit);
+
+      return prepare(
+        `SELECT *
+         FROM role_loadouts
+         ${where}
+         ORDER BY loadout_key, revision DESC, loadout_id
+         LIMIT ?`,
+      )
+        .all(...params, limit)
+        .map(rowToRoleLoadout);
+    },
+
+    bindRoleLoadout({ role, loadoutId, expectedCurrentLoadoutId } = {}) {
+      requireString('role', role);
+      requireString('loadoutId', loadoutId);
+      if (expectedCurrentLoadoutId !== undefined && expectedCurrentLoadoutId !== null) {
+        requireString('expectedCurrentLoadoutId', expectedCurrentLoadoutId);
+      }
+
+      return withTransaction('IMMEDIATE', () => {
+        const loadoutRow = getRoleLoadoutRowById(loadoutId);
+        if (!loadoutRow) {
+          throw new Error(`Unknown role loadout: ${loadoutId}`);
+        }
+        if (loadoutRow.role !== role) {
+          throw new TaskConflictError(
+            `Role loadout "${loadoutId}" belongs to role "${loadoutRow.role}", not "${role}"`,
+            {
+              role,
+              loadoutId,
+              loadoutRole: loadoutRow.role,
+            },
+          );
+        }
+
+        const current = getRoleLoadoutBindingRow(role);
+        const currentLoadoutId = current?.loadout_id ?? null;
+        const expectedLoadoutId = expectedCurrentLoadoutId ?? null;
+        if (expectedCurrentLoadoutId !== undefined && currentLoadoutId !== expectedLoadoutId) {
+          throw new TaskConflictError(
+            `Role loadout binding for "${role}" expected ${expectedLoadoutId} but found ${currentLoadoutId}`,
+            {
+              role,
+              expectedCurrentLoadoutId: expectedLoadoutId,
+              currentLoadoutId,
+            },
+          );
+        }
+
+        if (currentLoadoutId === loadoutId) {
+          return {
+            status: 'replayed',
+            binding: rowToRoleLoadoutBinding(current),
+          };
+        }
+
+        const boundAt = now();
+        prepare(
+          `INSERT INTO role_loadout_bindings(role, loadout_id, bound_at)
+           VALUES(?, ?, ?)
+           ON CONFLICT(role) DO UPDATE
+           SET loadout_id = excluded.loadout_id,
+               bound_at = excluded.bound_at`,
+        ).run(role, loadoutId, boundAt);
+
+        appendEvent('role-loadout.bound', 'role_loadout_binding', role, {
+          role,
+          loadoutId,
+          loadoutRevision: loadoutRow.revision,
+          contentHash: loadoutRow.content_hash,
+        });
+
+        return {
+          status: 'bound',
+          binding: rowToRoleLoadoutBinding(getRoleLoadoutBindingRow(role)),
+        };
+      });
+    },
+
+    getRoleLoadoutBinding(role) {
+      requireString('role', role);
+      return rowToRoleLoadoutBinding(getRoleLoadoutBindingRow(role));
+    },
+
+    listRoleLoadoutBindings() {
+      return prepare(
+        'SELECT role, loadout_id, bound_at FROM role_loadout_bindings ORDER BY role',
+      )
+        .all()
+        .map(rowToRoleLoadoutBinding);
+    },
+
+    resolveRoleLoadout(role) {
+      requireString('role', role);
+
+      return withTransaction('DEFERRED', () => {
+        const binding = getRoleLoadoutBindingRow(role);
+        if (!binding) {
+          return null;
+        }
+
+        const loadout = rowToRoleLoadout(getRoleLoadoutRowById(binding.loadout_id));
+        if (!loadout) {
+          throw new Error(`Missing role loadout for binding: ${binding.loadout_id}`);
+        }
+
+        const assets = loadout.entries.map((entry) => {
+          const asset = rowToProjectAsset(getProjectAssetRowById(entry.assetId));
+          if (!asset) {
+            throw new Error(`Role loadout "${loadout.loadoutId}" references unknown asset: ${entry.assetId}`);
+          }
+          return {
+            assetId: asset.assetId,
+            assetKey: asset.assetKey,
+            revision: asset.revision,
+            kind: asset.kind,
+            memoryLayer: asset.memoryLayer,
+            title: asset.title,
+            contentText: asset.contentText,
+            contentHash: asset.contentHash,
+            source: asset.source,
+            createdAt: asset.createdAt,
+            injectionMode: entry.injectionMode,
+            priority: entry.priority,
+          };
+        });
+
+        return deepFreeze({
+          role,
+          boundAt: binding.bound_at,
+          loadoutId: loadout.loadoutId,
+          loadoutKey: loadout.loadoutKey,
+          loadoutRevision: loadout.revision,
+          contentHash: loadout.contentHash,
+          byteBudget: loadout.byteBudget,
+          assets,
+        });
+      });
     },
 
     getTask(taskId) {

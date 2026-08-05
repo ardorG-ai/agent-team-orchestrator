@@ -166,6 +166,127 @@ test('runWorkerOnce completes a task and publishes a deterministic review candid
   }
 });
 
+test('runWorkerOnce resolves the bound role loadout, injects bounded references, and audits exact hashes', async () => {
+  const harness = createStoreHarness('orchestrator-loadout');
+  const store = harness.open();
+  const worktreePath = await makeWorktreeRoot('loadout');
+  let deliveredPrompt = '';
+
+  try {
+    store.configureChannel({ channel: 'review', capacity: 3 });
+    const memory = store.createProjectAsset({
+      assetKey: 'memory/project-safety',
+      kind: 'memory',
+      memoryLayer: 'l3',
+      title: 'Project safety doctrine',
+      contentText: 'Never land an unverified candidate into main.',
+      expectedRevision: 0,
+    }).asset;
+    const knowledge = store.createProjectAsset({
+      assetKey: 'knowledge/codegraph',
+      kind: 'knowledge',
+      title: 'CodeGraph reference',
+      contentText: 'This large knowledge body must stay outside the prompt.',
+      source: {
+        tool: 'codegraph',
+        action: 'context',
+        secret: 'source metadata must not enter the prompt',
+      },
+      expectedRevision: 0,
+    }).asset;
+    const loadout = store.createRoleLoadout({
+      loadoutKey: 'builder/default',
+      role: 'builder',
+      byteBudget: 2_048,
+      entries: [
+        { assetId: memory.assetId, injectionMode: 'direct', priority: 10 },
+        { assetId: knowledge.assetId, injectionMode: 'tool', priority: 1 },
+      ],
+      expectedRevision: 0,
+    }).loadout;
+    store.bindRoleLoadout({ role: 'builder', loadoutId: loadout.loadoutId });
+    const task = store.createTask({
+      key: 'loadout-task',
+      payload: {
+        adapter: 'codex',
+        role: 'builder',
+        title: 'Use project context safely',
+      },
+    }).task;
+
+    const result = await runWorkerOnce({
+      adapters: {
+        codex: async ({ prompt }) => {
+          deliveredPrompt = prompt;
+          return {
+            finalMessage: 'Never land an unverified candidate into main.',
+            ok: true,
+            terminal: {
+              message: 'Never land an unverified candidate into main.',
+              status: 'success',
+            },
+          };
+        },
+      },
+      context: harness.context,
+      createWorktree: async () => ({
+        baseOid: '3'.repeat(40),
+        branchName: `${task.taskId}-g1`,
+        worktreePath,
+      }),
+      snapshotWorktree: async () => ({
+        candidateOid: '4'.repeat(40),
+        clean: true,
+        worktreePath,
+      }),
+      store,
+      worker: 'worker-loadout',
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.match(deliveredPrompt, /Controller-selected role reference/);
+    assert.match(deliveredPrompt, /Never land an unverified candidate into main/);
+    assert.doesNotMatch(deliveredPrompt, /This large knowledge body must stay outside the prompt/);
+    assert.match(deliveredPrompt, /"tool":"codegraph"/);
+    assert.doesNotMatch(deliveredPrompt, /source metadata must not enter the prompt/);
+
+    const snapshotEvent = store.listEventLog()
+      .find((event) => event.kind === 'task.event.loadout-snapshot');
+    assert.ok(snapshotEvent);
+    const eventPayload = JSON.parse(snapshotEvent.payload_json);
+    const receipt = eventPayload.payload;
+    assert.equal(eventPayload.taskId, task.taskId);
+    assert.equal(eventPayload.type, 'loadout-snapshot');
+    assert.equal(receipt.loadoutId, loadout.loadoutId);
+    assert.equal(receipt.role, 'builder');
+    assert.equal(receipt.bytes <= 2_048, true);
+    assert.deepEqual(receipt.assets.map((asset) => asset.assetId), [memory.assetId, knowledge.assetId]);
+    assert.equal(JSON.stringify(eventPayload).includes('Never land'), false);
+    assert.equal(JSON.stringify(eventPayload).includes('codegraph'), false);
+
+    const runtimeEvent = store.listEventLog()
+      .find((event) => event.kind === 'task.event.runtime');
+    assert.ok(runtimeEvent);
+    const runtimePayload = JSON.parse(runtimeEvent.payload_json).payload;
+    assert.deepEqual(runtimePayload, {
+      aborted: false,
+      adapter: 'codex',
+      exitCode: null,
+      nativeSessionId: null,
+      nativeThreadId: null,
+      ok: true,
+      terminalStatus: 'success',
+      timedOut: false,
+    });
+    assert.equal(JSON.stringify(runtimePayload).includes('Never land'), false);
+    assert.equal(store.verifyEventLog().ok, true);
+  } finally {
+    store.close();
+    harness.cleanup();
+    await fs.rm(worktreePath, { force: true, recursive: true });
+  }
+});
+
 test('runWorkerOnce fences adapter failure into failTask without snapshotting', async () => {
   const harness = createStoreHarness('orchestrator-adapter-failure');
   const store = harness.open();

@@ -628,6 +628,354 @@ test('failed tasks require an expected generation for explicit retry', () => {
   }
 });
 
+test('project assets are insert-only revisions with replay semantics and redacted audit events', () => {
+  const harness = createStoreHarness('project-assets');
+  const store = harness.open();
+
+  try {
+    const created = store.createProjectAsset({
+      assetKey: 'memory/brief',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Alpha brief',
+      contentText: 'Remember the alpha constraints.',
+      source: { z: 2, a: 1 },
+      expectedRevision: 0,
+    });
+    const replay = store.createProjectAsset({
+      assetKey: 'memory/brief',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Alpha brief',
+      contentText: 'Remember the alpha constraints.',
+      source: { a: 1, z: 2 },
+      expectedRevision: 0,
+    });
+    const revisionTwo = store.createProjectAsset({
+      assetKey: 'memory/brief',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Alpha brief v2',
+      contentText: 'Remember the alpha constraints and beta risks.',
+      source: { source: 'controller' },
+      expectedRevision: 1,
+    });
+
+    assert.equal(created.status, 'created');
+    assert.equal(created.asset.revision, 1);
+    assert.equal(replay.status, 'replayed');
+    assert.equal(replay.asset.assetId, created.asset.assetId);
+    assert.equal(revisionTwo.asset.revision, 2);
+    assert.equal(store.getProjectAsset(created.asset.assetId).assetId, created.asset.assetId);
+    assert.equal(store.getProjectAsset({ assetKey: 'memory/brief' }).revision, 2);
+    assert.deepEqual(
+      store.listProjectAssets({ keyPrefix: 'memory/' }).map((asset) => asset.revision),
+      [2, 1],
+    );
+
+    assert.throws(
+      () =>
+        store.createProjectAsset({
+          assetKey: 'memory/brief',
+          kind: 'memory',
+          memoryLayer: 'l1',
+          title: 'stale',
+          contentText: 'stale',
+          expectedRevision: 9,
+        }),
+      (error) => error instanceof TaskConflictError,
+    );
+
+    const assetEvents = store
+      .listEventLog()
+      .filter((event) => event.kind === 'project-asset.created')
+      .map((event) => JSON.parse(event.payload_json));
+
+    assert.equal(assetEvents.length, 2);
+    assert.deepEqual(
+      Object.keys(assetEvents[0]).sort(),
+      ['assetId', 'assetKey', 'contentHash', 'revision'],
+    );
+    assert.equal(JSON.stringify(assetEvents).includes('Remember the alpha constraints'), false);
+    assert.equal(JSON.stringify(assetEvents).includes('source'), false);
+    assert.equal(store.verifyEventLog().ok, true);
+  } finally {
+    store.close();
+    harness.cleanup();
+  }
+});
+
+test('project asset keyPrefix matches literal prefixes rather than LIKE wildcards', () => {
+  const harness = createStoreHarness('project-asset-prefix');
+  const store = harness.open();
+
+  try {
+    const percentAsset = store.createProjectAsset({
+      assetKey: 'memory/100%/brief',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Percent prefix',
+      contentText: 'Literal percent in key.',
+      expectedRevision: 0,
+    }).asset;
+    const underscoreAsset = store.createProjectAsset({
+      assetKey: 'memory/a_/brief',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Underscore prefix',
+      contentText: 'Literal underscore in key.',
+      expectedRevision: 0,
+    }).asset;
+    const backslashAsset = store.createProjectAsset({
+      assetKey: 'memory/back\\slash/brief',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Backslash prefix',
+      contentText: 'Literal backslash in key.',
+      expectedRevision: 0,
+    }).asset;
+    store.createProjectAsset({
+      assetKey: 'memory/1000/brief',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Wildcard false positive',
+      contentText: 'Should not match literal percent prefix.',
+      expectedRevision: 0,
+    });
+    store.createProjectAsset({
+      assetKey: 'memory/ab/brief',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Wildcard false positive',
+      contentText: 'Should not match literal underscore prefix.',
+      expectedRevision: 0,
+    });
+    store.createProjectAsset({
+      assetKey: 'memory/backslash/brief',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Wildcard false positive',
+      contentText: 'Should not match literal backslash prefix.',
+      expectedRevision: 0,
+    });
+
+    assert.deepEqual(
+      store.listProjectAssets({ keyPrefix: 'memory/100%' }).map((asset) => asset.assetId),
+      [percentAsset.assetId],
+    );
+    assert.deepEqual(
+      store.listProjectAssets({ keyPrefix: 'memory/a_' }).map((asset) => asset.assetId),
+      [underscoreAsset.assetId],
+    );
+    assert.deepEqual(
+      store.listProjectAssets({ keyPrefix: 'memory/back\\' }).map((asset) => asset.assetId),
+      [backslashAsset.assetId],
+    );
+  } finally {
+    store.close();
+    harness.cleanup();
+  }
+});
+
+test('role loadouts validate assets, normalize entries, bind with CAS, and resolve immutable references', () => {
+  const harness = createStoreHarness('role-loadouts');
+  const store = harness.open();
+
+  try {
+    const memory = store.createProjectAsset({
+      assetKey: 'memory/ops',
+      kind: 'memory',
+      memoryLayer: 'l2',
+      title: 'Ops memory',
+      contentText: 'Prefer narrow diffs.',
+      expectedRevision: 0,
+    }).asset;
+    const skill = store.createProjectAsset({
+      assetKey: 'skill/reviewer',
+      kind: 'skill',
+      title: 'Reviewer skill',
+      contentText: 'Call out risks first.',
+      source: { handbook: 'review-playbook' },
+      expectedRevision: 0,
+    }).asset;
+
+    const created = store.createRoleLoadout({
+      loadoutKey: 'executor/default',
+      role: 'executor',
+      entries: [
+        { assetId: skill.assetId, injectionMode: 'reference', priority: 3 },
+        { assetId: memory.assetId, injectionMode: 'direct', priority: 9 },
+      ],
+      expectedRevision: 0,
+    });
+    const replay = store.createRoleLoadout({
+      loadoutKey: 'executor/default',
+      role: 'executor',
+      entries: [
+        { assetId: memory.assetId, injectionMode: 'direct', priority: 9 },
+        { assetId: skill.assetId, injectionMode: 'reference', priority: 3 },
+      ],
+      expectedRevision: 0,
+    });
+    const revisionTwo = store.createRoleLoadout({
+      loadoutKey: 'executor/default',
+      role: 'executor',
+      entries: [{ assetId: memory.assetId, injectionMode: 'summary', priority: 5 }],
+      byteBudget: 1_024,
+      expectedRevision: 1,
+    });
+
+    assert.equal(created.status, 'created');
+    assert.deepEqual(
+      created.loadout.entries.map((entry) => entry.assetId),
+      [memory.assetId, skill.assetId],
+    );
+    assert.equal(created.loadout.byteBudget, 8_192);
+    assert.equal(replay.status, 'replayed');
+    assert.equal(replay.loadout.loadoutId, created.loadout.loadoutId);
+    assert.equal(store.getRoleLoadout({ loadoutKey: 'executor/default' }).revision, 2);
+    assert.deepEqual(
+      store.listRoleLoadouts({ role: 'executor' }).map((loadout) => loadout.revision),
+      [2, 1],
+    );
+
+    assert.throws(
+      () =>
+        store.createRoleLoadout({
+          loadoutKey: 'executor/missing',
+          role: 'executor',
+          entries: [{ assetId: 'missing-asset', injectionMode: 'tool', priority: 1 }],
+          expectedRevision: 0,
+        }),
+      /Unknown project asset/,
+    );
+    assert.throws(
+      () =>
+        store.createRoleLoadout({
+          loadoutKey: 'executor/default',
+          role: 'executor',
+          entries: [{ assetId: memory.assetId, injectionMode: 'summary', priority: 1 }],
+          expectedRevision: 9,
+        }),
+      (error) => error instanceof TaskConflictError,
+    );
+
+    const firstBind = store.bindRoleLoadout({
+      role: 'executor',
+      loadoutId: created.loadout.loadoutId,
+    });
+    const bindReplay = store.bindRoleLoadout({
+      role: 'executor',
+      loadoutId: created.loadout.loadoutId,
+      expectedCurrentLoadoutId: created.loadout.loadoutId,
+    });
+
+    assert.equal(firstBind.status, 'bound');
+    assert.equal(bindReplay.status, 'replayed');
+    assert.equal(store.getRoleLoadoutBinding('executor').loadoutId, created.loadout.loadoutId);
+
+    assert.throws(
+      () =>
+        store.bindRoleLoadout({
+          role: 'executor',
+          loadoutId: revisionTwo.loadout.loadoutId,
+          expectedCurrentLoadoutId: 'wrong-loadout',
+        }),
+      (error) => error instanceof TaskConflictError,
+    );
+
+    const rebound = store.bindRoleLoadout({
+      role: 'executor',
+      loadoutId: revisionTwo.loadout.loadoutId,
+      expectedCurrentLoadoutId: created.loadout.loadoutId,
+    });
+    const resolved = store.resolveRoleLoadout('executor');
+
+    assert.equal(rebound.status, 'bound');
+    assert.deepEqual(store.listRoleLoadoutBindings(), [
+      {
+        role: 'executor',
+        loadoutId: revisionTwo.loadout.loadoutId,
+        boundAt: rebound.binding.boundAt,
+      },
+    ]);
+    assert.equal(resolved.loadoutId, revisionTwo.loadout.loadoutId);
+    assert.equal(Object.isFrozen(resolved), true);
+    assert.equal(Object.isFrozen(resolved.assets), true);
+    assert.equal(Object.isFrozen(resolved.assets[0]), true);
+    assert.equal(resolved.assets.length, 1);
+    assert.equal(resolved.assets[0].assetId, memory.assetId);
+    assert.throws(() => {
+      resolved.assets[0].title = 'mutated';
+    }, TypeError);
+
+    const loadoutEvents = store
+      .listEventLog()
+      .filter((event) => event.kind.startsWith('role-loadout.'))
+      .map((event) => JSON.parse(event.payload_json));
+
+    assert.deepEqual(
+      Object.keys(loadoutEvents[0]).sort(),
+      ['contentHash', 'loadoutId', 'loadoutKey', 'revision', 'role'],
+    );
+    assert.deepEqual(
+      Object.keys(loadoutEvents.at(-1)).sort(),
+      ['contentHash', 'loadoutId', 'loadoutRevision', 'role'],
+    );
+    assert.equal(JSON.stringify(loadoutEvents).includes('entries'), false);
+    assert.equal(store.verifyEventLog().ok, true);
+  } finally {
+    store.close();
+    harness.cleanup();
+  }
+});
+
+test('resolveRoleLoadout wraps binding, loadout, and asset reads in one deferred transaction', () => {
+  const harness = createStoreHarness('role-loadout-deferred');
+  const store = harness.open();
+
+  try {
+    const asset = store.createProjectAsset({
+      assetKey: 'memory/ops',
+      kind: 'memory',
+      memoryLayer: 'l1',
+      title: 'Ops memory',
+      contentText: 'Prefer one snapshot.',
+      expectedRevision: 0,
+    }).asset;
+    const loadout = store.createRoleLoadout({
+      loadoutKey: 'executor/default',
+      role: 'executor',
+      entries: [{ assetId: asset.assetId, injectionMode: 'direct', priority: 1 }],
+      expectedRevision: 0,
+    }).loadout;
+    store.bindRoleLoadout({
+      role: 'executor',
+      loadoutId: loadout.loadoutId,
+    });
+
+    const originalExec = DatabaseSync.prototype.exec;
+    const seenSql = [];
+    DatabaseSync.prototype.exec = function patchedExec(sql) {
+      seenSql.push(sql);
+      return originalExec.call(this, sql);
+    };
+
+    try {
+      const resolved = store.resolveRoleLoadout('executor');
+      assert.equal(resolved.loadoutId, loadout.loadoutId);
+      assert.equal(resolved.assets[0].assetId, asset.assetId);
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+    }
+
+    assert.deepEqual(seenSql, ['BEGIN DEFERRED', 'COMMIT']);
+  } finally {
+    store.close();
+    harness.cleanup();
+  }
+});
+
 test('event log verification detects payload tampering', () => {
   const harness = createStoreHarness('tamper-payload');
   let store = harness.open();

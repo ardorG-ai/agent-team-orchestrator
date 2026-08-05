@@ -248,6 +248,215 @@ test('daemon command initializes channels, starts the scheduler, and owns the li
   assert.equal(daemonClosed, true);
 });
 
+test('asset commands add, list, and show Project Brain assets including --content-file', async () => {
+  const { repo, stateRoot } = createRepository();
+  const assetFile = path.join(repo, 'brain-note.md');
+  writeFileSync(assetFile, 'Reference memory from file.\n', 'utf8');
+
+  await executeCli(['init', ...projectArgs(repo, stateRoot)]);
+
+  const created = await executeCli([
+    'asset', 'add',
+    '--key', 'memory/alpha',
+    '--kind', 'memory',
+    '--title', 'Alpha memory',
+    '--content-file', 'brain-note.md',
+    '--layer', 'l2',
+    '--source', JSON.stringify({ author: 'cli-test' }),
+    ...projectArgs(repo, stateRoot),
+  ], { cwd: repo });
+
+  const second = await executeCli([
+    'asset', 'add',
+    '--key', 'skill/beta',
+    '--kind', 'skill',
+    '--title', 'Beta skill',
+    '--content', 'Inline content',
+    ...projectArgs(repo, stateRoot),
+  ], { cwd: repo });
+
+  assert.equal(created.status, 'created');
+  assert.equal(created.asset.assetKey, 'memory/alpha');
+  assert.equal(created.asset.memoryLayer, 'l2');
+  assert.equal(created.asset.contentText, 'Reference memory from file.\n');
+  assert.deepEqual(created.asset.source, { author: 'cli-test' });
+
+  const listed = await executeCli([
+    'asset', 'list',
+    '--kind', 'memory',
+    '--key-prefix', 'memory/',
+    '--limit', '5',
+    ...projectArgs(repo, stateRoot),
+  ]);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].assetId, created.asset.assetId);
+
+  const shown = await executeCli([
+    'asset', 'show', created.asset.assetId,
+    ...projectArgs(repo, stateRoot),
+  ]);
+  assert.deepEqual(shown, created.asset);
+
+  const replay = await executeCli([
+    'asset', 'add',
+    '--key', 'skill/beta',
+    '--kind', 'skill',
+    '--title', 'Beta skill',
+    '--content', 'Inline content',
+    ...projectArgs(repo, stateRoot),
+  ], { cwd: repo });
+  assert.equal(second.status, 'created');
+  assert.equal(replay.status, 'replayed');
+  assert.equal(replay.asset.assetId, second.asset.assetId);
+});
+
+test('loadout commands create, bind, list, and show active role loadouts', async () => {
+  const { repo, stateRoot } = createRepository();
+  await executeCli(['init', ...projectArgs(repo, stateRoot)]);
+
+  const memoryAsset = await executeCli([
+    'asset', 'add',
+    '--key', 'memory/reviewer-checklist',
+    '--kind', 'memory',
+    '--title', 'Reviewer checklist',
+    '--content', 'Check the diff carefully.',
+    '--layer', 'l1',
+    ...projectArgs(repo, stateRoot),
+  ]);
+  const skillAsset = await executeCli([
+    'asset', 'add',
+    '--key', 'skill/reviewer-style',
+    '--kind', 'skill',
+    '--title', 'Reviewer style',
+    '--content', 'Report findings first.',
+    ...projectArgs(repo, stateRoot),
+  ]);
+
+  const created = await executeCli([
+    'loadout', 'create',
+    '--key', 'reviewer/default',
+    '--role', 'reviewer',
+    '--asset', `${memoryAsset.asset.assetId}:summary:50`,
+    '--asset', `${skillAsset.asset.assetId}:tool`,
+    '--byte-budget', '4096',
+    ...projectArgs(repo, stateRoot),
+  ]);
+
+  assert.equal(created.status, 'created');
+  assert.equal(created.loadout.loadoutKey, 'reviewer/default');
+  assert.equal(created.loadout.role, 'reviewer');
+  assert.equal(created.loadout.byteBudget, 4096);
+  assert.deepEqual(created.loadout.entries, [
+    {
+      assetId: memoryAsset.asset.assetId,
+      injectionMode: 'summary',
+      priority: 50,
+    },
+    {
+      assetId: skillAsset.asset.assetId,
+      injectionMode: 'tool',
+      priority: 1,
+    },
+  ]);
+
+  const bound = await executeCli([
+    'loadout', 'bind',
+    '--role', 'reviewer',
+    '--loadout', created.loadout.loadoutId,
+    '--expect-unbound', 'true',
+    ...projectArgs(repo, stateRoot),
+  ]);
+  assert.equal(bound.status, 'bound');
+  assert.equal(bound.binding.loadoutId, created.loadout.loadoutId);
+
+  const listed = await executeCli([
+    'loadout', 'list',
+    '--role', 'reviewer',
+    '--limit', '5',
+    ...projectArgs(repo, stateRoot),
+  ]);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].loadoutId, created.loadout.loadoutId);
+
+  const shown = await executeCli([
+    'loadout', 'show',
+    '--role', 'reviewer',
+    ...projectArgs(repo, stateRoot),
+  ]);
+  assert.equal(shown.role, 'reviewer');
+  assert.equal(shown.loadoutId, created.loadout.loadoutId);
+  assert.deepEqual(shown.assets.map((asset) => ({
+    assetId: asset.assetId,
+    injectionMode: asset.injectionMode,
+    priority: asset.priority,
+  })), [
+    {
+      assetId: memoryAsset.asset.assetId,
+      injectionMode: 'summary',
+      priority: 50,
+    },
+    {
+      assetId: skillAsset.asset.assetId,
+      injectionMode: 'tool',
+      priority: 1,
+    },
+  ]);
+});
+
+test('Project Brain CLI validation rejects invalid flag combinations and asset tokens', async () => {
+  const { repo, stateRoot } = createRepository();
+  await executeCli(['init', ...projectArgs(repo, stateRoot)]);
+
+  await assert.rejects(
+    executeCli([
+      'asset', 'add',
+      '--key', 'memory/bad',
+      '--kind', 'memory',
+      '--title', 'Bad asset',
+      '--content', 'inline',
+      '--content-file', 'ignored.txt',
+      ...projectArgs(repo, stateRoot),
+    ], { cwd: repo }),
+    { code: 'invalid_argument', message: '--content and --content-file are mutually exclusive' },
+  );
+
+  await assert.rejects(
+    executeCli([
+      'asset', 'add',
+      '--key', 'skill/bad-layer',
+      '--kind', 'skill',
+      '--title', 'Bad layer',
+      '--content', 'inline',
+      '--layer', 'l1',
+      ...projectArgs(repo, stateRoot),
+    ]),
+    { code: 'invalid_argument', message: '--layer is only allowed when --kind=memory' },
+  );
+
+  await assert.rejects(
+    executeCli([
+      'loadout', 'create',
+      '--key', 'reviewer/bad',
+      '--role', 'reviewer',
+      '--asset', 'asset-1:bogus',
+      ...projectArgs(repo, stateRoot),
+    ]),
+    { code: 'invalid_argument', message: /unsupported mode "bogus"/ },
+  );
+
+  await assert.rejects(
+    executeCli([
+      'loadout', 'bind',
+      '--role', 'reviewer',
+      '--loadout', 'loadout-1',
+      '--expected-current', 'loadout-0',
+      '--expect-unbound', 'true',
+      ...projectArgs(repo, stateRoot),
+    ]),
+    { code: 'invalid_argument', message: '--expected-current and --expect-unbound are mutually exclusive' },
+  );
+});
+
 test('task add rejects scheduler flags that v0.1 does not enforce', async () => {
   const { repo, stateRoot } = createRepository();
   await executeCli(['init', ...projectArgs(repo, stateRoot)]);
@@ -268,5 +477,5 @@ test('help does not advertise deferred scheduler flags', async () => {
   const help = await executeCli(['--help']);
   assert.doesNotMatch(help, /--priority|--max-attempts/);
   assert.match(help, /agent-team daemon/);
-  assert.equal(await executeCli(['--version']), '0.1.1');
+  assert.equal(await executeCli(['--version']), '0.2.0-dev.0');
 });
