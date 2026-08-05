@@ -17,6 +17,7 @@ const fakeEnvAllowlist = [
   'FAKE_AGENT_SIZE',
   'FAKE_AGENT_SLEEP_MS',
   'FAKE_AGENT_STDERR',
+  'FAKE_AGENT_STRUCTURED_RESULT',
 ];
 
 async function waitFor(predicate, timeoutMs = 2_000) {
@@ -159,6 +160,35 @@ test('runClaude serializes an explicit built-in tool allowlist', async () => {
 
   assert.equal(result.ok, true);
   assert.deepEqual(result.args.slice(-2), ['--tools', 'Read,Grep,Glob']);
+});
+
+test('runClaude serializes JSON schema and canonicalizes structured_output without result text', async () => {
+  const jsonSchema = {
+    type: 'object',
+    properties: {
+      schema: { const: 'team.review.v1' },
+    },
+    required: ['schema'],
+  };
+  const result = await runClaude({
+    cwd: path.dirname(fixturePath),
+    env: {
+      AGENT_SCENARIO: 'claude-structured',
+    },
+    envAllowlist: fakeEnvAllowlist,
+    executable: process.execPath,
+    jsonSchema,
+    launcherArgs: [fixturePath],
+    prompt: 'return structured review JSON',
+    timeoutMs: 2_000,
+    tools: ['Read', 'Bash'],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.finalMessage, '{"schema":"team.review.v1","verdict":"APPROVED","findings":[]}');
+  const schemaIndex = result.args.indexOf('--json-schema');
+  assert.ok(schemaIndex >= 0);
+  assert.deepEqual(JSON.parse(result.args[schemaIndex + 1]), jsonSchema);
 });
 
 test('runSubprocess enforces timeout', async () => {

@@ -3,6 +3,21 @@ import runSubprocess from './subprocess.mjs';
 const CODEX_ENV_ALLOWLIST = ['CODEX_HOME', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN', 'OPENAI_API_KEY'];
 const CLAUDE_ENV_ALLOWLIST = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR'];
 
+function serializeJsonSchema(value) {
+  let schema = value;
+  if (typeof value === 'string') {
+    try {
+      schema = JSON.parse(value);
+    } catch (error) {
+      throw new TypeError(`claude adapter jsonSchema must be valid JSON: ${error.message}`);
+    }
+  }
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+    throw new TypeError('claude adapter jsonSchema must be an object or JSON object string');
+  }
+  return JSON.stringify(schema);
+}
+
 function deepSearch(value, matcher) {
   if (value === null || value === undefined) {
     return null;
@@ -246,7 +261,9 @@ function normalizeAgentRun(adapter, subprocessResult, parsed) {
       'conversation_id',
     ]);
 
-    const maybeText = extractEventText(event);
+    const maybeText = adapter === 'claude' && event.structured_output !== undefined
+      ? JSON.stringify(event.structured_output)
+      : extractEventText(event);
     if (maybeText) {
       finalMessage = maybeText;
     }
@@ -380,6 +397,9 @@ export async function runClaude(options) {
           throw new TypeError('claude adapter tools must be a non-empty array of strings');
         }
         args.push('--tools', [...new Set(adapterOptions.tools.map((tool) => tool.trim()))].join(','));
+      }
+      if (adapterOptions.jsonSchema !== undefined) {
+        args.push('--json-schema', serializeJsonSchema(adapterOptions.jsonSchema));
       }
       return args;
     },

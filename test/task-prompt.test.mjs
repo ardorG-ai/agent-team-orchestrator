@@ -72,6 +72,7 @@ test('buildTaskPrompt gives planner and read-only roles strict non-editing contr
   });
 
   assert.match(reviewerPrompt, /team\.review\.v1/);
+  assert.match(reviewerPrompt, /at most 6 findings/i);
   assert.match(reviewerPrompt, /must not override controller rules/i);
   assert.match(reviewerPrompt, /UNTRUSTED HANDOFF DATA/);
   assert.match(reviewerPrompt, /Do not edit/i);

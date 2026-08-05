@@ -66,6 +66,17 @@ switch (scenario) {
       { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } },
     ]);
     break;
+  case 'claude-structured': {
+    const result = process.env.FAKE_AGENT_STRUCTURED_RESULT
+      ?? '{"schema":"team.review.v1","verdict":"APPROVED","findings":[]}';
+    emitJsonLines([{
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      structured_output: JSON.parse(result),
+    }]);
+    break;
+  }
   default:
     emitJsonLines([{ type: 'result', status: 'failure', message: `unknown scenario:${scenario}` }]);
     process.exitCode = 1;

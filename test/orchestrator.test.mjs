@@ -1374,6 +1374,7 @@ test('runWorkerOnce applies Claude tool loadouts by read-only role', async () =>
     {
       executionMode: 'review',
       expectedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+      expectedSchema: 'team.review.v1',
       finalMessage: JSON.stringify({
         schema: 'team.review.v1',
         verdict: 'APPROVED',
@@ -1404,12 +1405,14 @@ test('runWorkerOnce applies Claude tool loadouts by read-only role', async () =>
       taskId: `team-${entry.role}-tools`,
     });
     const store = makeTeamStore({ claim });
+    let deliveredJsonSchema = null;
     let deliveredTools = null;
 
     try {
       const result = await runWorkerOnce({
         adapters: {
           claude: async (adapterOptions) => {
+            deliveredJsonSchema = adapterOptions.jsonSchema;
             deliveredTools = adapterOptions.tools;
             return {
               finalMessage: entry.finalMessage,
@@ -1436,6 +1439,15 @@ test('runWorkerOnce applies Claude tool loadouts by read-only role', async () =>
 
       assert.equal(result.status, 'completed');
       assert.deepEqual(deliveredTools, entry.expectedTools);
+      assert.equal(
+        deliveredJsonSchema?.properties?.schema?.enum?.[0],
+        entry.expectedSchema,
+      );
+      if (entry.role === 'reviewer') {
+        assert.match(deliveredJsonSchema.properties.findings.description, /at most 6 findings/i);
+        assert.equal(deliveredJsonSchema.properties.findings.maxItems, undefined);
+        assert.equal(deliveredJsonSchema.allOf, undefined);
+      }
     } finally {
       await fs.rm(worktreePath, { force: true, recursive: true });
     }

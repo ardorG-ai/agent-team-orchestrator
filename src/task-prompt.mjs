@@ -1,4 +1,7 @@
-import { resolveExecutionMode } from './team-workflow.mjs';
+import {
+  resolveExecutionMode,
+  TEAM_REVIEW_PROVIDER_MAX_FINDINGS,
+} from './team-workflow.mjs';
 
 function section(title, value) {
   if (value === undefined || value === null || value === '') return '';
@@ -94,7 +97,7 @@ There must be exactly the builder, researcher, and test lanes. Acceptance criter
   "verdict": "APPROVED or CHANGES_REQUESTED",
   "findings": [{"severity": "LOW|MEDIUM|HIGH|CRITICAL", "text": "finding", "proof": "evidence"}]
 }
-HIGH and CRITICAL findings require non-empty proof. CHANGES_REQUESTED requires at least one finding. APPROVED must not contain HIGH or CRITICAL findings.`;
+Return at most ${TEAM_REVIEW_PROVIDER_MAX_FINDINGS} findings. HIGH and CRITICAL findings require non-empty proof. CHANGES_REQUESTED requires at least one finding. APPROVED must not contain HIGH or CRITICAL findings.`;
   }
 
   if (executionMode === 'verify') {

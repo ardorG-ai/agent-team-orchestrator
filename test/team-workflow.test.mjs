@@ -3,6 +3,8 @@ import test from 'node:test';
 
 import {
   TEAM_HANDOFF_MAX_BYTES,
+  TEAM_REVIEW_JSON_SCHEMA,
+  TEAM_REVIEW_PROVIDER_MAX_FINDINGS,
   aggregateTeamChildren,
   buildTeamChildren,
   buildTeamHandoff,
@@ -283,6 +285,18 @@ test('review and verification contracts fail closed on unknown fields and missin
     })),
     /unknown key/i,
   );
+  assert.throws(
+    () => parseTeamReview(JSON.stringify({
+      schema: 'team.review.v1',
+      verdict: 'CHANGES_REQUESTED',
+      findings: Array.from({ length: TEAM_REVIEW_PROVIDER_MAX_FINDINGS + 1 }, () => ({
+        severity: 'LOW',
+        text: 'Bounded finding.',
+        proof: '',
+      })),
+    })),
+    /at most 6/i,
+  );
 
   const verification = parseTeamVerification(JSON.stringify({
     schema: 'team.verify.v1',
@@ -308,6 +322,48 @@ test('review and verification contracts fail closed on unknown fields and missin
       checks: [],
     })),
     /at least 1/i,
+  );
+});
+
+test('review provider schema uses Claude-supported structure while controller enforces semantics', () => {
+  const supportedKeywords = new Set([
+    'additionalProperties',
+    'description',
+    'enum',
+    'items',
+    'properties',
+    'required',
+    'type',
+  ]);
+  const assertSupportedSchema = (schema, path = 'schema') => {
+    for (const key of Object.keys(schema)) {
+      assert.ok(supportedKeywords.has(key), `${path}.${key} is not provider-supported`);
+    }
+    for (const [key, child] of Object.entries(schema.properties ?? {})) {
+      assertSupportedSchema(child, `${path}.properties.${key}`);
+    }
+    if (schema.items) assertSupportedSchema(schema.items, `${path}.items`);
+  };
+
+  assertSupportedSchema(TEAM_REVIEW_JSON_SCHEMA);
+  assert.deepEqual(TEAM_REVIEW_JSON_SCHEMA.properties.schema.enum, ['team.review.v1']);
+  assert.match(TEAM_REVIEW_JSON_SCHEMA.properties.findings.description, /at most 6 findings/i);
+
+  assert.throws(
+    () => parseTeamReview(JSON.stringify({
+      schema: 'team.review.v1',
+      verdict: 'CHANGES_REQUESTED',
+      findings: [{ severity: 'MEDIUM', text: '   ', proof: '' }],
+    })),
+    /non-empty/i,
+  );
+  assert.throws(
+    () => parseTeamReview(JSON.stringify({
+      schema: 'team.review.v1',
+      verdict: 'CHANGES_REQUESTED',
+      findings: [{ severity: 'HIGH', text: 'Unsafe mutation', proof: '\n\t' }],
+    })),
+    /proof/i,
   );
 });
 

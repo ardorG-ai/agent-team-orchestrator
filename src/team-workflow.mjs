@@ -19,6 +19,40 @@ const REVIEW_VERDICTS = new Set(['APPROVED', 'CHANGES_REQUESTED']);
 const VERIFY_VERDICTS = new Set(['PASS', 'FAIL']);
 const CHECK_STATUSES = new Set(['PASS', 'FAIL']);
 
+export const TEAM_REVIEW_PROVIDER_MAX_FINDINGS = 6;
+
+// Claude structured outputs support structural JSON Schema but reject value bounds such as
+// maxLength/maxItems. Keep the provider schema structural and enforce the full contract below.
+export const TEAM_REVIEW_JSON_SCHEMA = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    schema: { type: 'string', enum: ['team.review.v1'] },
+    verdict: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUESTED'] },
+    findings: {
+      type: 'array',
+      description: `Return at most ${TEAM_REVIEW_PROVIDER_MAX_FINDINGS} findings. CHANGES_REQUESTED requires at least one finding. APPROVED must not include HIGH or CRITICAL findings.`,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          severity: { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] },
+          text: {
+            type: 'string',
+            description: `Non-whitespace finding text, limited to ${ITEM_MAX_BYTES} UTF-8 bytes by the controller.`,
+          },
+          proof: {
+            type: 'string',
+            description: `Evidence for the finding, limited to ${TEXT_MAX_BYTES} UTF-8 bytes by the controller. HIGH and CRITICAL require non-whitespace proof; LOW and MEDIUM may use an empty string.`,
+          },
+        },
+        required: ['severity', 'text', 'proof'],
+      },
+    },
+  },
+  required: ['schema', 'verdict', 'findings'],
+});
+
 const DEFAULT_TEAM_ADAPTERS = Object.freeze({
   builder: 'codex',
   researcher: 'claude',
@@ -264,7 +298,9 @@ function normalizeReview(value) {
   }
 
   const verdict = requireEnum('team.review.verdict', review.verdict, REVIEW_VERDICTS);
-  const findings = requireArray('team.review.findings', review.findings, { max: 24 })
+  const findings = requireArray('team.review.findings', review.findings, {
+    max: TEAM_REVIEW_PROVIDER_MAX_FINDINGS,
+  })
     .map((entry, index) => {
       const finding = assertExactKeys(
         `team.review.findings[${index}]`,

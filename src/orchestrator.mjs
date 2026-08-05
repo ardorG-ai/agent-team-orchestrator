@@ -15,6 +15,7 @@ import {
   parseTeamReview,
   parseTeamVerification,
   resolveExecutionMode,
+  TEAM_REVIEW_JSON_SCHEMA,
 } from './team-workflow.mjs';
 import {
   commitWorktreeCandidate as defaultCommitWorktreeCandidate,
@@ -342,6 +343,7 @@ function resolveAdapterRunOptions(
     'env',
     'executable',
     'launcherArgs',
+    'jsonSchema',
     'maxStderrBytes',
     'maxStdoutBytes',
     'timeoutMs',
@@ -358,7 +360,10 @@ function resolveAdapterRunOptions(
   } else if (adapterName === 'claude'
     && executionMode === 'review'
     && role === 'reviewer') {
-    roleDefaults = { tools: ['Read', 'Grep', 'Glob', 'Bash'] };
+    roleDefaults = {
+      jsonSchema: TEAM_REVIEW_JSON_SCHEMA,
+      tools: ['Read', 'Grep', 'Glob', 'Bash'],
+    };
   }
 
   return {
