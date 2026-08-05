@@ -161,6 +161,40 @@ test('runSubprocess enforces stdout size cap', async () => {
   assert.equal(result.terminationReason, 'stdout');
 });
 
+test('runSubprocess absorbs stdin EPIPE when a child exits before reading input', async () => {
+  const result = await runSubprocess({
+    command: process.execPath,
+    args: ['-e', 'process.exit(9)'],
+    cwd: path.dirname(fixturePath),
+    input: 'x'.repeat(1024 * 1024),
+    timeoutMs: 2_000,
+    maxStdoutBytes: 1024,
+    maxStderrBytes: 1024,
+  });
+
+  assert.equal(result.exitCode, 9);
+  assert.equal(result.success, false);
+  if (result.stdinError) assert.match(result.stdinError.code ?? '', /EPIPE|ERR_STREAM_DESTROYED/);
+});
+
+test('adapter rejects a terminal success event when prompt delivery fails', async () => {
+  const result = await runCodex({
+    cwd: path.dirname(fixturePath),
+    executable: process.execPath,
+    launcherArgs: [
+      '-e',
+      'process.stdout.write(JSON.stringify({type:"turn.completed"})+"\\n"); process.exit(0)',
+    ],
+    prompt: 'x'.repeat(1024 * 1024),
+    timeoutMs: 2_000,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.terminationReason, 'stdin');
+  assert.equal(result.terminal.status, 'failure');
+  assert.equal(result.terminal.message, 'prompt delivery failed');
+});
+
 test('runCodex normalizes abort to terminal failure', async () => {
   const controller = new AbortController();
   setTimeout(() => controller.abort(), 25);

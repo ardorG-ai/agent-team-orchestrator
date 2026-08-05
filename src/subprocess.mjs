@@ -149,7 +149,10 @@ export async function runSubprocess(options) {
   let aborted = false;
   let outputLimit = null;
   let spawnError = null;
+  let stdinError = null;
   let settled = false;
+  const inputText = input === null || input === undefined ? '' : String(input);
+  const inputBytes = Buffer.byteLength(inputText);
 
   const startedAt = Date.now();
   const allowedEnv = buildAllowedEnv(env, envAllowlist);
@@ -202,6 +205,10 @@ export async function runSubprocess(options) {
       }
     });
 
+    child.stdin.on('error', (error) => {
+      stdinError = error;
+    });
+
     child.once('close', (exitCode, signal) => {
       settled = true;
       resolve({ exitCode, signal });
@@ -213,11 +220,7 @@ export async function runSubprocess(options) {
       }
     });
 
-    if (input !== null && input !== undefined) {
-      child.stdin.end(String(input));
-    } else {
-      child.stdin.end();
-    }
+    child.stdin.end(inputText);
   }).finally(() => {
     if (timeoutId) {
       clearTimeout(timeoutId);
@@ -234,8 +237,15 @@ export async function runSubprocess(options) {
   const stdout = Buffer.concat(stdoutState.chunks).toString('utf8');
   const stderr = Buffer.concat(stderrState.chunks).toString('utf8');
   const durationMs = Date.now() - startedAt;
-  const success = !aborted && !timedOut && !outputLimit && result.exitCode === 0;
-  const terminationReason = aborted ? 'aborted' : (timedOut ? 'timeout' : outputLimit);
+  const stdinFailed = inputBytes > 0 && stdinError !== null;
+  const success = !aborted
+    && !timedOut
+    && !outputLimit
+    && !stdinFailed
+    && result.exitCode === 0;
+  const terminationReason = aborted
+    ? 'aborted'
+    : (timedOut ? 'timeout' : (outputLimit ?? (stdinFailed ? 'stdin' : null)));
 
   return {
     aborted,
@@ -249,6 +259,9 @@ export async function runSubprocess(options) {
     stderr,
     stderrBytes: stderrState.size,
     stderrTruncated: outputLimit === 'stderr',
+    stdinError: stdinError
+      ? { code: stdinError.code ?? null, message: stdinError.message }
+      : null,
     stdout,
     stdoutBytes: stdoutState.size,
     stdoutTruncated: outputLimit === 'stdout',

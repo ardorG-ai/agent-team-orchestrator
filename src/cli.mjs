@@ -236,7 +236,7 @@ export async function executeCli(argv, options = {}) {
     return HELP;
   }
   if (booleanFlag(parsed, 'version') || parsed.positionals[0] === 'version') {
-    return '0.1.0';
+    return '0.1.1';
   }
 
   const command = commandKey(parsed);

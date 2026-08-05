@@ -178,4 +178,5 @@ test('task add rejects scheduler flags that v0.1 does not enforce', async () => 
 test('help does not advertise deferred scheduler flags', async () => {
   const help = await executeCli(['--help']);
   assert.doesNotMatch(help, /--priority|--max-attempts/);
+  assert.equal(await executeCli(['--version']), '0.1.1');
 });

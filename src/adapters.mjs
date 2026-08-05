@@ -268,6 +268,9 @@ function normalizeAgentRun(adapter, subprocessResult, parsed) {
   if (subprocessResult.aborted) {
     terminalStatus = 'failure';
     terminalMessage = 'process aborted';
+  } else if (subprocessResult.terminationReason === 'stdin') {
+    terminalStatus = 'failure';
+    terminalMessage = 'prompt delivery failed';
   } else if (subprocessResult.terminationReason === 'stdout') {
     terminalStatus = 'failure';
     terminalMessage = 'stdout exceeded cap';
@@ -285,10 +288,7 @@ function normalizeAgentRun(adapter, subprocessResult, parsed) {
     finalMessage = terminalMessage;
   }
 
-  const ok = terminalStatus === 'success'
-    && subprocessResult.exitCode === 0
-    && !subprocessResult.timedOut
-    && !subprocessResult.aborted;
+  const ok = terminalStatus === 'success' && subprocessResult.success;
 
   return {
     adapter,
@@ -305,12 +305,14 @@ function normalizeAgentRun(adapter, subprocessResult, parsed) {
     ok,
     signal: subprocessResult.signal,
     stderr: subprocessResult.stderr,
+    stdinError: subprocessResult.stdinError,
     stdout: subprocessResult.stdout,
     terminal: {
       message: terminalMessage,
       status: terminalStatus,
     },
     timedOut: subprocessResult.timedOut,
+    terminationReason: subprocessResult.terminationReason,
     terminalSeen,
   };
 }
